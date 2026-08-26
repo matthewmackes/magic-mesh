@@ -86,6 +86,7 @@ pub(crate) struct CatalogEntry {
 
 fn page_label(page: PageEntry) -> &'static str {
     match page.route {
+        "this-node/overview" => "Node status",
         "this-node/network" => "Network & internet",
         "this-node/display-sound" => "Displays",
         _ => page.label,
@@ -255,6 +256,51 @@ pub(crate) fn landing_destination(group: CatalogGroup) -> WorkersDestination {
         .map_or(WorkersDestination::Overview, |entry| entry.destination)
 }
 
+pub(crate) fn blurb(entry: CatalogEntry) -> &'static str {
+    match entry.destination {
+        WorkersDestination::ThisNodePage(page) => page.description,
+        WorkersDestination::Overview => "Health, search, and every settings page.",
+        WorkersDestination::MeshMap => "Live overlay topology and links.",
+        WorkersDestination::Network => "Mesh fabric, overlay routing, and network services.",
+        WorkersDestination::Discovery => "Discovered mesh, LAN, and cloud units.",
+        WorkersDestination::Fleet => "Roster, node health, and fleet rollup.",
+        WorkersDestination::Provisioning => "Onboarding, deployment, and join posture.",
+        WorkersDestination::Phones => "Paired phones and device permissions.",
+        WorkersDestination::PhonePair => "Start a governed phone pairing.",
+        WorkersDestination::PhoneFiles => "Files on a paired phone.",
+        WorkersDestination::PhoneServices => "Services published by a paired phone.",
+        WorkersDestination::PhoneCommands => "Governed commands for a paired phone.",
+        WorkersDestination::ActionConsole => "Worker runtime, relations, and governed actions.",
+        WorkersDestination::SafePower => CatalogGroup::SafePower.description(),
+        WorkersDestination::ThisNode => CatalogGroup::ThisNode.description(),
+    }
+}
+
+pub(crate) fn matches_query(entry: CatalogEntry, query: &str) -> bool {
+    let normalized = query.trim();
+    if normalized.is_empty() {
+        return true;
+    }
+    let needle = normalized.to_ascii_lowercase();
+    let haystacks = [
+        entry.label,
+        entry.id,
+        entry.group.label(),
+        entry.section.unwrap_or(""),
+        blurb(entry),
+    ];
+    if haystacks
+        .iter()
+        .any(|hay| hay.to_ascii_lowercase().contains(&needle))
+    {
+        return true;
+    }
+    match entry.destination {
+        WorkersDestination::ThisNodePage(page) => page.matches(normalized),
+        _ => false,
+    }
+}
+
 pub(crate) fn plane(destination: WorkersDestination) -> Option<Plane> {
     match destination {
         WorkersDestination::ThisNode => Some(Plane::ThisNode),
@@ -298,5 +344,28 @@ mod tests {
             entries.last().map(|entry| entry.destination),
             Some(WorkersDestination::SafePower)
         );
+        assert_eq!(
+            entries
+                .iter()
+                .find(|entry| entry.id == "this-node/overview")
+                .map(|entry| entry.label),
+            Some("Node status")
+        );
+        assert!(matches_query(
+            entries
+                .iter()
+                .copied()
+                .find(|entry| entry.id == "this-node/display-sound")
+                .expect("displays"),
+            "monitor"
+        ));
+        assert!(!matches_query(
+            entries
+                .iter()
+                .copied()
+                .find(|entry| entry.id == "this-node/display-sound")
+                .expect("displays"),
+            "vitelity"
+        ));
     }
 }

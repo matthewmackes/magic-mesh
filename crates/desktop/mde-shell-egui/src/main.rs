@@ -1298,6 +1298,8 @@ struct Shell {
     this_node_page: this_node_catalog::PageEntry,
     /// Persistent query for the This Node section search.
     this_node_search: String,
+    /// Persistent query for the Control Panel catalog (rail + Overview index).
+    workers_search: String,
     workers_destination: WorkersDestination,
     /// The onboard self-test watch (OW-10) — observes the `event/onboard/self-test`
     /// verdict lane and raises a one-shot edge the instant a node goes all-green, so
@@ -1506,6 +1508,7 @@ impl Shell {
             this_node_section: this_node_catalog::Section::default(),
             this_node_page: this_node_catalog::page_index()[0],
             this_node_search: String::new(),
+            workers_search: String::new(),
             workers_destination: workers_catalog::default_destination(),
             self_test: mesh_view::SelfTestWatch::default(),
             clock: timers::ClockState::default(),
@@ -1624,6 +1627,7 @@ impl Shell {
         let saved_this_node_section = self.this_node_section;
         let saved_this_node_page = self.this_node_page;
         let saved_this_node_search = self.this_node_search.clone();
+        let saved_workers_search = self.workers_search.clone();
         self.nav.expanded = true;
         self.nav.surface = location.surface;
         self.nav.plane = location.plane;
@@ -1649,6 +1653,7 @@ impl Shell {
         self.this_node_section = saved_this_node_section;
         self.this_node_page = saved_this_node_page;
         self.this_node_search = saved_this_node_search;
+        self.workers_search = saved_workers_search;
 
         match result {
             Ok(Ok(png)) => {
@@ -2361,6 +2366,8 @@ impl Shell {
         ui.push_id("shell-workers", |ui| {
             let _ = AppFrame::new("Control Panel").leading_title().show(ui);
             ui.add_space(Style::SP_S);
+            Self::show_workers_search(ui, &mut self.workers_search);
+            ui.add_space(Style::SP_S);
             if shell_settings_is_narrow(ui) {
                 self.show_workers_compact_picker(ui, &entries, &mut destination);
                 ui.separator();
@@ -2369,7 +2376,12 @@ impl Shell {
                         .min(SHELL_SETTINGS_DETAIL_MAX_W)
                         .max(1.0),
                 );
-                self.show_workers_destination(ui, &mut destination);
+                egui::ScrollArea::vertical()
+                    .id_salt("workers-destination")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        self.show_workers_destination(ui, &mut destination);
+                    });
             } else {
                 let (rail_w, detail_w) = shell_settings_wide_split_widths(ui.available_width());
                 let height = ui.available_height().max(1.0);
@@ -2390,13 +2402,32 @@ impl Shell {
                         egui::Layout::top_down(egui::Align::Min),
                         |ui| {
                             ui.set_max_width(detail_w);
-                            self.show_workers_destination(ui, &mut destination);
+                            egui::ScrollArea::vertical()
+                                .id_salt("workers-destination")
+                                .auto_shrink([false, false])
+                                .show(ui, |ui| {
+                                    self.show_workers_destination(ui, &mut destination);
+                                });
                         },
                     );
                 });
             }
         });
         self.workers_destination = destination;
+    }
+
+    fn show_workers_search(ui: &mut egui::Ui, query: &mut String) {
+        ui.horizontal_wrapped(|ui| {
+            ui.label("Find a setting");
+            ui.add(
+                egui::TextEdit::singleline(query)
+                    .hint_text("Displays, network, phones, health…")
+                    .desired_width(THIS_NODE_SEARCH_MAX_WIDTH),
+            );
+            if !query.is_empty() && ui.button("Clear").clicked() {
+                query.clear();
+            }
+        });
     }
 
     fn show_workers_catalog(
@@ -2407,6 +2438,7 @@ impl Shell {
     ) {
         ui.set_width(ui.available_width().min(SHELL_SETTINGS_RAIL_W).max(1.0));
         let selected_group = workers_catalog::group(*selected);
+        let query = self.workers_search.clone();
         egui::ScrollArea::vertical()
             .id_salt("workers-category-rail")
             .auto_shrink([false, false])
@@ -2414,8 +2446,13 @@ impl Shell {
                 for group in CatalogGroup::ALL {
                     let grouped = entries
                         .iter()
-                        .filter(|entry| entry.group == group)
+                        .filter(|entry| {
+                            entry.group == group && workers_catalog::matches_query(**entry, &query)
+                        })
                         .collect::<Vec<_>>();
+                    if grouped.is_empty() {
+                        continue;
+                    }
                     if group == CatalogGroup::Home {
                         let entry = grouped[0];
                         if ui
@@ -2440,29 +2477,32 @@ impl Shell {
                     {
                         *selected = workers_catalog::landing_destination(group);
                     }
-                    if workers_catalog::group(*selected) == group {
-                        ui.indent(("workers-category", group), |ui| {
-                            let mut prior_section = None;
-                            for entry in grouped {
-                                if entry.section != prior_section {
-                                    if let Some(section) = entry.section {
-                                        ui.label(
-                                            egui::RichText::new(section).small().strong().color(
-                                                Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
-                                            ),
-                                        );
-                                    }
-                                    prior_section = entry.section;
-                                }
-                                if ui
-                                    .selectable_label(*selected == entry.destination, entry.label)
-                                    .clicked()
-                                {
-                                    *selected = entry.destination;
-                                }
-                            }
-                        });
+                    let expand = selected_group == group || !query.trim().is_empty();
+                    if !expand {
+                        continue;
                     }
+                    ui.indent(("workers-category", group), |ui| {
+                        let mut prior_section = None;
+                        for entry in grouped {
+                            if entry.section != prior_section {
+                                if let Some(section) = entry.section {
+                                    ui.label(
+                                        egui::RichText::new(section)
+                                            .small()
+                                            .strong()
+                                            .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
+                                    );
+                                }
+                                prior_section = entry.section;
+                            }
+                            if ui
+                                .selectable_label(*selected == entry.destination, entry.label)
+                                .clicked()
+                            {
+                                *selected = entry.destination;
+                            }
+                        }
+                    });
                 }
             });
     }
@@ -2487,7 +2527,10 @@ impl Shell {
                         ui.add_space(Style::SP_S);
                     }
                     ui.label(egui::RichText::new(group.label()).small().strong());
-                    for entry in entries.iter().filter(|entry| entry.group == group) {
+                    for entry in entries.iter().filter(|entry| {
+                        entry.group == group
+                            && workers_catalog::matches_query(**entry, &self.workers_search)
+                    }) {
                         let label = entry.section.map_or_else(
                             || entry.label.to_owned(),
                             |section| format!("{section} › {}", entry.label),
@@ -2526,7 +2569,13 @@ impl Shell {
                 let mut section = page.section;
                 let mut selected_page = page;
                 let mut tab = ThisNodeTab::System;
-                self.show_this_node_workspace(ui, &mut tab, &mut section, &mut selected_page);
+                self.show_this_node_workspace(
+                    ui,
+                    &mut tab,
+                    &mut section,
+                    &mut selected_page,
+                    false,
+                );
                 self.this_node_section = section;
                 self.this_node_page = selected_page;
             }
@@ -2585,48 +2634,31 @@ impl Shell {
         let _ = AppFrame::new("Overview").show(ui);
         ui.colored_label(
             Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
-            "Choose a control area. Scope grows from this workstation to the entire fleet.",
+            "All settings for this workstation and the mesh.",
         );
         ui.add_space(Style::SP_M);
-        let groups = [
+        self.show_workers_health_card(ui);
+        ui.add_space(Style::SP_M);
+        let query = self.workers_search.clone();
+        let catalog = workers_catalog::catalog();
+        for group in [
             CatalogGroup::ThisNode,
             CatalogGroup::Mesh,
             CatalogGroup::Fleet,
             CatalogGroup::ConnectedDevices,
             CatalogGroup::Advanced,
-        ];
-        let columns = if ui.available_width() >= SHELL_SETTINGS_WIDE_MIN_W {
-            2
-        } else {
-            1
-        };
-        for row in groups.chunks(columns) {
-            ui.columns(columns, |panes| {
-                for (pane, group) in panes.iter_mut().zip(row.iter().copied()) {
-                    mde_egui::card().show(pane, |ui| {
-                        ui.label(
-                            egui::RichText::new(group.label())
-                                .strong()
-                                .size(Style::TITLE),
-                        );
-                        ui.colored_label(
-                            Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
-                            group.description(),
-                        );
-                        ui.add_space(Style::SP_S);
-                        if ui.button(format!("Open {}", group.label())).clicked() {
-                            *destination = workers_catalog::landing_destination(group);
-                        }
-                    });
-                }
-            });
-            ui.add_space(Style::SP_S);
-        }
-        ui.add_space(Style::SP_XL);
-        ui.separator();
-        ui.add_space(Style::SP_M);
-        mde_egui::card().show(ui, |ui| {
-            let group = CatalogGroup::SafePower;
+            CatalogGroup::SafePower,
+        ] {
+            let grouped: Vec<_> = catalog
+                .iter()
+                .copied()
+                .filter(|entry| {
+                    entry.group == group && workers_catalog::matches_query(*entry, &query)
+                })
+                .collect();
+            if grouped.is_empty() {
+                continue;
+            }
             ui.label(
                 egui::RichText::new(group.label())
                     .strong()
@@ -2637,10 +2669,76 @@ impl Shell {
                 group.description(),
             );
             ui.add_space(Style::SP_S);
-            if ui.button(format!("Open {}", group.label())).clicked() {
-                *destination = workers_catalog::landing_destination(group);
+            Self::show_workers_overview_tiles(ui, &grouped, destination);
+            ui.add_space(Style::SP_M);
+        }
+    }
+
+    fn show_workers_health_card(&mut self, ui: &mut egui::Ui) {
+        mde_egui::card().show(ui, |ui| {
+            ui.label(
+                egui::RichText::new("System and Mesh Health")
+                    .strong()
+                    .size(Style::TITLE),
+            );
+            let snapshot = self.chrome.health().snapshot();
+            let issues = self.chrome.health().active_count();
+            let caption = snapshot
+                .and_then(|snapshot| {
+                    snapshot
+                        .current_node_grades
+                        .iter()
+                        .find(|grade| grade.node == snapshot.observer)
+                        .or_else(|| snapshot.current_node_grades.first())
+                        .map(|grade| {
+                            if issues == 0 {
+                                format!("This node grade {}.", grade.grade.as_str())
+                            } else {
+                                format!(
+                                    "This node grade {} · {issues} active issue{}.",
+                                    grade.grade.as_str(),
+                                    if issues == 1 { "" } else { "s" }
+                                )
+                            }
+                        })
+                })
+                .unwrap_or_else(|| "Health not yet reported on this seat.".to_owned());
+            ui.colored_label(Style::resolve_color(ui.ctx(), Style::TEXT_DIM), caption);
+            ui.add_space(Style::SP_S);
+            if ui.button("Open Health").clicked() {
+                self.construct.open_health();
             }
         });
+    }
+
+    fn show_workers_overview_tiles(
+        ui: &mut egui::Ui,
+        entries: &[CatalogEntry],
+        destination: &mut WorkersDestination,
+    ) {
+        let columns = if ui.available_width() >= SHELL_SETTINGS_WIDE_MIN_W {
+            2
+        } else {
+            1
+        };
+        for row in entries.chunks(columns) {
+            ui.columns(columns, |panes| {
+                for (pane, entry) in panes.iter_mut().zip(row.iter()) {
+                    mde_egui::card().show(pane, |ui| {
+                        ui.label(egui::RichText::new(entry.label).strong().size(Style::TITLE));
+                        ui.colored_label(
+                            Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
+                            workers_catalog::blurb(*entry),
+                        );
+                        ui.add_space(Style::SP_S);
+                        if ui.button(format!("Open {}", entry.label)).clicked() {
+                            *destination = entry.destination;
+                        }
+                    });
+                }
+            });
+            ui.add_space(Style::SP_S);
+        }
     }
 
     /// Apply the Surface card's navigation-only post-MOK handoff. Authority is
@@ -2719,7 +2817,7 @@ impl Shell {
                                 .min(SHELL_SETTINGS_DETAIL_MAX_W)
                                 .max(1.0),
                         );
-                        self.show_this_node_workspace(ui, &mut tab, &mut section, &mut page);
+                        self.show_this_node_workspace(ui, &mut tab, &mut section, &mut page, true);
                     } else {
                         let (rail_w, detail_w) =
                             shell_settings_wide_split_widths(ui.available_width());
@@ -2760,6 +2858,7 @@ impl Shell {
                                         &mut tab,
                                         &mut section,
                                         &mut page,
+                                        true,
                                     );
                                 },
                             );
@@ -2778,6 +2877,7 @@ impl Shell {
         tab: &mut ThisNodeTab,
         section: &mut this_node_catalog::Section,
         page: &mut this_node_catalog::PageEntry,
+        show_workspace_chrome: bool,
     ) {
         ui.set_max_width(
             ui.available_width()
@@ -2789,19 +2889,21 @@ impl Shell {
             self.thisnode.show_actions_with_system(ui, &mut self.system);
             return;
         }
-        ui.label(egui::RichText::new("Workspace").strong());
-        ui.add_space(Style::SP_XS);
-        mde_egui::card().show(ui, |ui| {
-            ui.label(
-                egui::RichText::new(section.label())
-                    .strong()
-                    .size(Style::TITLE),
-            );
-            ui.label(
-                egui::RichText::new(section.description())
-                    .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
-            );
-        });
+        if show_workspace_chrome {
+            ui.label(egui::RichText::new("Workspace").strong());
+            ui.add_space(Style::SP_XS);
+            mde_egui::card().show(ui, |ui| {
+                ui.label(
+                    egui::RichText::new(section.label())
+                        .strong()
+                        .size(Style::TITLE),
+                );
+                ui.label(
+                    egui::RichText::new(section.description())
+                        .color(Style::resolve_color(ui.ctx(), Style::TEXT_DIM)),
+                );
+            });
+        }
         if let Some(settings_section) = this_node_system_route(page.route)
             .and_then(|_| this_node_system_section(page.route, *section))
         {
@@ -7543,18 +7645,32 @@ mod tests {
             assert!(
                 texts
                     .iter()
-                    .any(|(text, _)| text.contains("Choose a control area")),
+                    .any(|(text, _)| text.contains("All settings for this workstation")),
                 "Control Panel overview body is missing at width={width}"
             );
+            for anchor in [
+                "Find a setting",
+                "Displays",
+                "Network & internet",
+                "Sound",
+                "System and Mesh Health",
+            ] {
+                assert!(
+                    texts.iter().any(|(text, _)| text == anchor),
+                    "Control Panel {anchor:?} is missing at width={width}"
+                );
+            }
             for (text, rect) in &texts {
                 assert!(
-                    rect.right() <= width + 1.0 && rect.bottom() <= height + 1.0,
+                    rect.right() <= width + 1.0
+                        && rect.left() >= -1.0
+                        && rect.top() <= height + 1.0,
                     "Control Panel {text:?} paints off-screen at width={width}: {rect:?}"
                 );
             }
             let choose = texts
                 .iter()
-                .find(|(text, _)| text.contains("Choose a control area"))
+                .find(|(text, _)| text.contains("All settings for this workstation"))
                 .expect("overview caption");
             assert!(
                 choose.1.width() <= SHELL_SETTINGS_DETAIL_MAX_W + Style::SP_XL,

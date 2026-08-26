@@ -91,11 +91,20 @@ Mesh Teams Files visit cannot create `files-folder-prefs.json`.
 
 ## Farm
 
-Focused gate `cargo test -p mde-files-egui`. Prior result at this dirty
-HEAD: job `a1183c2d3475` pass, 210 tests, `172.20.0.130` slot 1,
-`b6fd8aeab-dirty`. This unit pinned `.90` slot 2 per leftover host
-constraint (`.50`/`.90`/`.170`); see the worklist current-state line
-for the `.90` outcome recorded with this evidence.
+Focused gate `cargo test -p mde-files-egui` on `.90` slot 2 (host pin
+per leftover unit; `.50`/`.90`/`.170`). Cold compile of
+`mde-files-egui` **failed** (`exit 101`, `2026-08-26T12:02:46Z`–
+`2026-08-26T12:11:14Z`):
+
+```text
+error[E0609]: no field `bookmarks` on type `std::vec::Vec<bookmarks::UserBookmark>`
+ --> crates/desktop/mde-files-egui/src/bookmarks.rs:232:33
+```
+
+That path is outside this unit's write scope (`model/mod.rs` only).
+A warm `.130` result `a1183c2d3475` at this dirty HEAD reported
+`210 passed` in 0.75s without rebuilding the lib; it is not a cold
+compile of the tree this unit rsynced.
 
 ## What this does not prove
 
