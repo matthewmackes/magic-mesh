@@ -145,21 +145,26 @@ const fn leader_chord(key: egui::Key) -> Option<&'static str> {
     })
 }
 
+/// Surfaces whose focused editor / PTY / guest keeps Ctrl+J / Ctrl+N.
+///
+/// Documents is Communications' editor mode, not a separate Springboard
+/// surface. Terminal's PTY, Desktop VDI, and guest Chromium own the same
+/// industry-standard chords. The catalog refuses natively so the apply site
+/// does not remap those surfaces onto Terminal.
+const fn is_transfer_ctrl_refuse_surface(surface: Surface) -> bool {
+    matches!(
+        surface,
+        Surface::Communications | Surface::Terminal | Surface::Desktop | Surface::Browser
+    )
+}
+
 /// Whether a catalogued Transfers Ctrl chord must **pass through** (refuse to
 /// fire) so Documents, Terminal, Desktop, or Browser keep the keystroke.
-///
-/// Communications is Documents mode; its editor owns Ctrl+J / Ctrl+N while a
-/// text field has focus. Terminal's PTY is the same: those chords are editing
-/// / line-discipline keys, not host Transfers accelerators. Desktop and
-/// Browser guests keep the same chords while a guest has focus (VDI /
-/// Chromium) — the catalog refuses natively so the apply site does not remap
-/// those surfaces onto Terminal.
 const fn transfer_ctrl_passes_through(surface: Option<Surface>, text_focus: bool) -> bool {
-    text_focus
-        && matches!(
-            surface,
-            Some(Surface::Communications | Surface::Terminal | Surface::Desktop | Surface::Browser)
-        )
+    match surface {
+        Some(s) => text_focus && is_transfer_ctrl_refuse_surface(s),
+        None => false,
+    }
 }
 
 /// Map a Ctrl-held named key to the catalog chord string. These fire on Construct
@@ -916,6 +921,67 @@ mod tests {
             r.dispatch(&[], &[ctrl_press(egui::Key::N)]),
             vec![HotkeyAction::NewTransfer],
             "chrome dispatch (no text surface) still fires New Transfer"
+        );
+    }
+
+    #[test]
+    fn ctrl_j_and_ctrl_n_fire_from_every_springboard_surface_except_the_refuse_set() {
+        // S1 catalog completeness: Ctrl+J opens Transfers from every
+        // Springboard surface. Documents (Communications), Terminal, Desktop,
+        // and Browser refuse only while they have text / guest focus; every
+        // other `Surface::ALL` entry fires even with a focused field. Ctrl+N
+        // is the same catalog gate; in-mode consumption stays at the apply
+        // site / Transfers renderer (not this module).
+        let mut r = HotkeyRouter::default();
+        for surface in Surface::ALL {
+            let refuses = is_transfer_ctrl_refuse_surface(surface);
+            assert_eq!(
+                transfer_ctrl_passes_through(Some(surface), true),
+                refuses,
+                "{surface:?} text-focus refuse must be Documents/Terminal/Desktop/Browser"
+            );
+            assert!(
+                !transfer_ctrl_passes_through(Some(surface), false),
+                "{surface:?} without text focus must not refuse the catalog"
+            );
+            for (key, action) in [
+                (egui::Key::J, HotkeyAction::OpenTransfers),
+                (egui::Key::N, HotkeyAction::NewTransfer),
+            ] {
+                let focused = r.dispatch_for(&[], &[ctrl_press(key)], Some(surface), true);
+                if refuses {
+                    assert!(
+                        focused.is_empty(),
+                        "Ctrl+{key:?} must pass through {surface:?} text/guest focus"
+                    );
+                } else {
+                    assert_eq!(
+                        focused,
+                        vec![action],
+                        "Ctrl+{key:?} must fire from {surface:?} even with a focused field"
+                    );
+                }
+                assert_eq!(
+                    r.dispatch_for(&[], &[ctrl_press(key)], Some(surface), false),
+                    vec![action],
+                    "without text focus {surface:?} still fires Ctrl+{key:?}"
+                );
+            }
+        }
+        let refuse: Vec<_> = Surface::ALL
+            .iter()
+            .copied()
+            .filter(|&s| is_transfer_ctrl_refuse_surface(s))
+            .collect();
+        assert_eq!(
+            refuse,
+            [
+                Surface::Desktop,
+                Surface::Browser,
+                Surface::Terminal,
+                Surface::Communications,
+            ],
+            "the refuse set must stay exactly Desktop/Browser/Terminal/Documents (Communications) in ALL order"
         );
     }
 
