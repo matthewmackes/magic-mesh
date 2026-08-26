@@ -1724,15 +1724,12 @@ story execution contract above.
 - Required outcome: Ctrl+J opens Communications Transfers from any Construct
   surface and one in-mode accelerator starts a new transfer; both are
   registered in the shared keymap.
-- Current state: source complete. Catalog + apply refuse are in-tree and on
-  dest-cut `4071ed295` (NEVRA `13.0.0-35`; hotkeys.rs empty vs HEAD). This
-  agent did not SSH Seat 15 or Dell (used DRM). Health Fix click (FUNC-023)
-  had no frame and did not press Ctrl+J/Ctrl+N; leftover remains a live
-  keystroke on a used seat. Catalog, dock-journal, dest-cut, and Health Fix
-  do not close S1. No uinput; no invented dest. Evidence:
-  `WL-FUNC-032-2026-08-23-installed-hotkeys-catalog-r1.md`,
-  `WL-FUNC-032-2026-08-24-live-hotkeys-r1.md`,
-  `WL-FUNC-032-2026-08-25-live-keystroke-after-health-fix-r1.md`.
+- Current state: dest-cut `bc14a22d7` packs `Ctrl+J` / `Ctrl+N` catalog.
+  Seat 15 Keychron chords (existing `event4`, not uinput) produced no
+  journal and no readable kmsgrab frame. Apply/refuse now journal
+  `open_transfers` / `transfer_hotkey_refused` in-tree (farm 1591/0);
+  not dest-cut yet. Evidence:
+  `WL-FUNC-032-2026-08-25-destcut-keystroke-no-frame-r1.md`.
 - Remaining work: leftover is live-surface keystroke proof on Seat 15, not a
   missing binding. Catalog and dock-journal do not close it. Needs Ctrl+J from
   every surface and in-mode Ctrl+N, with refuse on Documents / Terminal /

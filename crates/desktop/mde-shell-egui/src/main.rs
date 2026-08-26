@@ -2203,11 +2203,23 @@ impl Shell {
                 self.open_front_door_panel();
             }
             HotkeyAction::OpenTransfers => {
+                tracing::info!(
+                    target: "mde_shell_egui::hotkeys",
+                    chord = "Ctrl+J",
+                    surface = ?self.nav.surface,
+                    "open_transfers"
+                );
                 self.nav.expanded = true;
                 self.nav.surface = Surface::Communications;
                 mde_collab_egui::request_open_transfers();
             }
             HotkeyAction::NewTransfer => {
+                tracing::info!(
+                    target: "mde_shell_egui::hotkeys",
+                    chord = "Ctrl+N",
+                    surface = ?self.nav.surface,
+                    "new_transfer"
+                );
                 if self.nav.surface == Surface::Communications {
                     mde_collab_egui::request_new_transfer();
                 }
@@ -3662,6 +3674,12 @@ impl Shell {
                 ) && self.transfer_hotkey_shadowed(ctx)
                 {
                     // Documents/Terminal keep the keystroke; do not consume it.
+                    tracing::info!(
+                        target: "mde_shell_egui::hotkeys",
+                        action = ?action,
+                        surface = ?self.nav.surface,
+                        "transfer_hotkey_refused"
+                    );
                 } else {
                     if matches!(
                         action,
