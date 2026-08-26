@@ -1359,17 +1359,17 @@ story execution contract above.
 - Required outcome: every lock-1 operation is reachable from the Files menubar
   and context menu and executes through the existing FileOps/OpKind/archive
   engine with the standard confirm, progress, and cancel treatment.
-- Current state: dest-cut `4071ed295` (`13.0.0-35`) on Surface
-  `172.20.146.79` `peer:SURFACE`. Construct pid `1290917` holds card1
-  `2736x1824`; unit pins `XDG_CONFIG_HOME=/root/.config`. kmsgrab acquired
-  XR30 X-tiled (`-f null` 0); PNG/VAAPI failed. No GUI click. `mesh_mount`
-  census `running` gen 645; no lock-11 mount, no persist, no FileOps CLI.
-  Evidence: `WL-FUNC-025-2026-08-25-surface-files-posix-r1.md`.
-- Remaining work: leftover is live seat Files (local/mesh + archive-queue)
-  on a current-revision seat. Worker census and kmsgrab acquire are not a
-  POSIX op. dest-cut matches current-tree menubar/view/dialogs. Farm
+- Current state: dest-cut `bc14a22d7` (`13.0.0-35`) on Surface
+  `172.20.146.79` `peer:SURFACE`. Construct pid `3653` holds card1; unit
+  pins `XDG_CONFIG_HOME=/root/.config`. Live FileOps/OpQueue ran all six
+  POSIX ops on local xfs (`/root/Local`); no lock-11 mesh mount. No
+  Construct menubar click. Evidence:
+  `WL-FUNC-025-2026-08-26-surface-files-posix-r1.md`.
+- Remaining work: leftover is lock-11 mesh-mounted tree plus Construct
+  Files menubar/context (test-bin OpQueue is not pid 3653). dest-cut
+  `bc14a22d7` matches current-tree menubar/dialogs FileOps wiring. Farm
   fixture: `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md`. Surface:
-  `WL-FUNC-025-2026-08-25-surface-files-posix-r1.md`. Fixtures do not close.
+  `WL-FUNC-025-2026-08-26-surface-files-posix-r1.md`. Fixtures do not close.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
