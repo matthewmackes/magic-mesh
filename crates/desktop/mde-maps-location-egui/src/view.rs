@@ -6,9 +6,8 @@ use mde_egui::egui::{
 };
 use mde_egui::menubar::{ChipTone, Menu, MenuBar, MenuBarModel, StatusChip};
 use mde_egui::nav_chrome::{Sidebar, SidebarRow, SidebarSection};
-use mde_egui::{Style, StyleColorScheme, TypographyRole, paint_carbon};
+use mde_egui::{paint_carbon, Style, StyleColorScheme, TypographyRole};
 
-use crate::MapsLocationSurface;
 use crate::model::{
     AdminSection, BackupRecord, CheckState, DeadZoneSeverity, DeadZoneState, Destination,
     DeviceIoState, EncryptedVaultState, FirmwareWorkflow, LocationManager, LocationSample,
@@ -20,7 +19,8 @@ use crate::model::{
     VehicleMirrorStatus, VehicleRadioAvailability, VehicleRadioHealth, VehicleRadioOperation,
     VehicleRadioPresence, VehicleState, WorkspaceTab,
 };
-use crate::weather_ui::{WeatherField, WeatherRange, WeatherTruth, format_temperature};
+use crate::weather_ui::{format_temperature, WeatherField, WeatherRange, WeatherTruth};
+use crate::MapsLocationSurface;
 
 const MG90_SIDEBAR_SALT: &str = "mg90-control";
 const RAIL_W: f32 = 176.0;
@@ -31,6 +31,10 @@ const MAP_LAYERS_POPUP_WIDTH: f32 = 280.0;
 const MAP_LAYERS_POPUP_HEIGHT: f32 = 360.0;
 const MAP_LAYERS_POPUP_GAP: f32 = Style::SP_XS;
 const ADMIN_CARD_MIN_WIDTH: f32 = 280.0;
+/// Detail/reading width for the MG90 configuration interface. Unbounded
+/// `available_width` stretches inspect cards and YAML onto a 1920–3840 HDMI
+/// seat the same way Control Panel did before its rail/detail cap.
+const MG90_DETAIL_MAX_W: f32 = Style::SP_XL * 32.0;
 const CARD_MIN_H: f32 = 84.0;
 const MAP_DARK_BG: Color32 = Color32::from_rgb(0x0D, 0x13, 0x18); // style-leak-ok: map-content-color
 const MAP_LIGHT_BG: Color32 = Color32::from_rgb(0xE8, 0xEF, 0xE8); // style-leak-ok: map-content-color
@@ -38,18 +42,18 @@ const ROUTE_BLUE: Color32 = Color32::from_rgb(0x4C, 0xA3, 0xFF); // style-leak-o
 const ROUTE_ALT: Color32 = Color32::from_rgb(0x7D, 0xD9, 0xA3); // style-leak-ok: map-content-color
 const WEATHER: Color32 = Color32::from_rgb(0x67, 0xD6, 0xE8); // style-leak-ok: map-content-color
 const TRAFFIC: Color32 = Color32::from_rgb(0xFF, 0xB4, 0x54); // style-leak-ok: map-content-color
-// --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quazar-dark route palette) ---
-// A premium GMaps-navigation blue, painted as a top-lit vertical gradient
-// (HI at the top edge → BASE → DEEP at the bottom) so the banner reads with
-// depth instead of a single flat fill.
+                                                              // --- Driving HUD (Google Maps / Waze vocabulary, keyed to the Quazar-dark route palette) ---
+                                                              // A premium GMaps-navigation blue, painted as a top-lit vertical gradient
+                                                              // (HI at the top edge → BASE → DEEP at the bottom) so the banner reads with
+                                                              // depth instead of a single flat fill.
 const MANEUVER_BLUE: Color32 = Color32::from_rgb(0x1A, 0x66, 0xE0); // style-leak-ok: map-content-color
 const MANEUVER_BLUE_HI: Color32 = Color32::from_rgb(0x3E, 0x86, 0xFF); // style-leak-ok: map-content-color
 const MANEUVER_BLUE_DEEP: Color32 = Color32::from_rgb(0x11, 0x4C, 0xB6); // style-leak-ok: map-content-color
 const ROUTE_CASING: Color32 = Color32::from_rgb(0x14, 0x4C, 0x92); // style-leak-ok: map-content-color
 const HUD_CARD_BG: Color32 = Color32::from_rgb(0x1A, 0x1B, 0x22); // style-leak-ok: map-content-color
 const HUD_CARD_HI: Color32 = Color32::from_rgb(0x24, 0x26, 0x30); // style-leak-ok: map-content-color
-// Keep these content colors intentionally distinct from Style::TEXT_STRONG and
-// Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
+                                                                  // Keep these content colors intentionally distinct from Style::TEXT_STRONG and
+                                                                  // Style::TEXT_DIM: the shell's Light remapper keys on exact token values.
 const MAP_TEXT_STRONG: Color32 = Color32::from_rgb(0xF5, 0xF6, 0xFA); // style-leak-ok: map-content-color
 const MAP_TEXT_DIM: Color32 = Color32::from_rgb(0xB8, 0xC0, 0xCC); // style-leak-ok: map-content-color
 
@@ -489,7 +493,11 @@ fn format_distance(mi: f32) -> String {
 }
 
 fn finite_or(value: f32, default: f32) -> f32 {
-    if value.is_finite() { value } else { default }
+    if value.is_finite() {
+        value
+    } else {
+        default
+    }
 }
 
 /// A finite, non-degenerate rect from raw components (crash-safe layout).
@@ -4378,22 +4386,31 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         state.control.queue_read("list-config", "{}", "config list");
     }
 
-    ui.horizontal_wrapped(|ui| {
-        let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
-        let _ = paint_carbon(ui.painter(), rect, "settings", Style::ACCENT_HI);
-        ui.add_space(Style::SP_XS);
-        ui.label(
-            RichText::new("MG90")
-                .size(Style::TITLE)
-                .color(Style::TEXT_STRONG),
-        );
-        ui.with_layout(egui::Layout::right_to_left(Align::Center), |ui| {
+    let header_w = ui
+        .available_rect_before_wrap()
+        .intersect(ui.clip_rect())
+        .width()
+        .max(1.0);
+    ui.allocate_ui_with_layout(
+        egui::vec2(header_w, Style::TITLE + Style::SP_L),
+        egui::Layout::left_to_right(Align::Center).with_main_wrap(true),
+        |ui| {
+            ui.set_max_width(header_w);
+            let (rect, _) = ui.allocate_exact_size(Vec2::splat(18.0), Sense::hover());
+            let _ = paint_carbon(ui.painter(), rect, "settings", Style::ACCENT_HI);
+            ui.add_space(Style::SP_XS);
+            ui.label(
+                RichText::new("MG90")
+                    .size(Style::TITLE)
+                    .color(Style::TEXT_STRONG),
+            );
+            ui.add_space(Style::SP_S);
             pill(ui, "keys 1–9", Style::ACCENT);
             if let Some(esn) = mg90_esn(state) {
                 pill(ui, &esn, Style::TEXT_DIM);
             }
-        });
-    });
+        },
+    );
     mde_egui::widgets::muted_note(
         ui,
         "Full control of the attached AirLink MG90. Status is live; writes are typed Bus verbs armed on the ESN.",
@@ -4434,7 +4451,13 @@ fn show_admin(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             },
         );
         ui.add_space(Style::SP_S);
-        ui.vertical(|ui| {
+        let detail_w = ui.available_width().min(MG90_DETAIL_MAX_W).max(1.0);
+        let height = ui.available_height().max(1.0);
+        ui.allocate_ui_with_layout(
+            egui::vec2(detail_w, height),
+            egui::Layout::top_down(Align::Min),
+            |ui| {
+            ui.set_max_width(detail_w);
             mg90_connection_card(ui, state);
             ui.add_space(Style::SP_S);
             match state.admin_section {
@@ -4753,6 +4776,7 @@ fn show_mg90_config(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
         } else {
             egui::ComboBox::from_id_salt("mg90-config-file")
                 .selected_text(&state.control.config_file)
+                .width(ui.available_width().min(MG90_DETAIL_MAX_W).max(1.0))
                 .show_ui(ui, |ui| {
                     for file in &state.control.config_files {
                         ui.selectable_value(&mut state.control.config_file, file.clone(), file);
@@ -4771,7 +4795,9 @@ fn show_mg90_config(ui: &mut egui::Ui, state: &mut MapsLocationSurface) {
             ui.add_space(Style::SP_S);
             egui::ScrollArea::vertical()
                 .max_height(280.0)
+                .max_width(ui.available_width().min(MG90_DETAIL_MAX_W).max(1.0))
                 .show(ui, |ui| {
+                    ui.set_max_width(ui.available_width());
                     ui.monospace(payload);
                 });
         }
@@ -4976,7 +5002,11 @@ fn show_vehicle(
                         .fuel_percent
                         .map_or_else(|| "unavailable".to_string(), |fuel| format!("{fuel:.0}%")),
                     telem.fuel_percent.map_or(Style::TEXT_DIM, |fuel| {
-                        if fuel < 15.0 { Style::WARN } else { Style::OK }
+                        if fuel < 15.0 {
+                            Style::WARN
+                        } else {
+                            Style::OK
+                        }
                     }),
                 )
             } else {
@@ -5595,7 +5625,11 @@ fn show_location_sources(ui: &mut egui::Ui, manager: &mut LocationManager) {
             // "0.00000, 0.00000" as a coordinate.
             let fixed = source.sample.has_fix();
             let on_fix = |value: String| {
-                if fixed { value } else { "—".to_string() }
+                if fixed {
+                    value
+                } else {
+                    "—".to_string()
+                }
             };
             metric(ui, "Fix", &source.sample.fix_type, Style::TEXT);
             metric(
@@ -6836,7 +6870,11 @@ fn coolant_tone(celsius: f32) -> Color32 {
 
 /// SIM/DTC-style tone: zero faults is OK, any present is a warn.
 fn count_tone(count: u32) -> Color32 {
-    if count == 0 { Style::OK } else { Style::WARN }
+    if count == 0 {
+        Style::OK
+    } else {
+        Style::WARN
+    }
 }
 
 /// A trimmed value, or an em-dash for an absent / empty live field (§7 — honest
@@ -7136,7 +7174,11 @@ fn source_readiness_tone(source: &LocationSource) -> Color32 {
 }
 
 fn bool_label(value: bool) -> &'static str {
-    if value { "yes" } else { "no" }
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn encrypted_label(value: bool) -> &'static str {
@@ -7508,6 +7550,79 @@ mod tests {
         assert_eq!(surface.admin_section, AdminSection::Config);
     }
 
+    fn collect_shape_text_rects(shape: &egui::epaint::Shape, out: &mut Vec<(String, Rect)>) {
+        match shape {
+            egui::epaint::Shape::Text(t) => out.push((
+                t.galley.text().to_string(),
+                Rect::from_min_size(t.pos, t.galley.size()),
+            )),
+            egui::epaint::Shape::Vec(v) => {
+                for s in v {
+                    collect_shape_text_rects(s, out);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    #[test]
+    fn mg90_admin_stays_on_screen_on_large_external_display() {
+        for width in [1366.0, 1920.0, 2560.0, 3840.0] {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            ctx.style_mut(|style| style.animation_time = 0.0);
+            let screen = Rect::from_min_size(Pos2::ZERO, egui::vec2(width, 1080.0));
+            let mut surface = MapsLocationSurface::simulated();
+            surface.active = WorkspaceTab::Admin;
+            surface.admin_section = AdminSection::Config;
+            surface.control.config_files = vec!["mcu.yaml".to_string(), "wan.yaml".to_string()];
+            surface.control.config_file = "mcu.yaml".to_string();
+            surface.control.payload =
+                Some("IGNTHRESH: 13.2\nLOWVOLT: 11.8\nHIGHVOLT: 15.4\nOFFDELAY: 300\n".repeat(8));
+
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(screen),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        show_admin(ui, &mut surface);
+                    });
+                },
+            );
+            let mut texts = Vec::new();
+            for clipped in &out.shapes {
+                collect_shape_text_rects(&clipped.shape, &mut texts);
+            }
+            assert!(
+                texts.iter().any(|(text, _)| text == "MG90"),
+                "MG90 title missing at width={width}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, _)| text.contains("Committed oMG config")),
+                "MG90 config body missing at width={width}"
+            );
+            for (text, rect) in &texts {
+                assert!(
+                    rect.right() <= width + 1.0 && rect.bottom() <= 1080.0 + 1.0,
+                    "MG90 {text:?} paints off-screen at width={width}: {rect:?}"
+                );
+            }
+            let config = texts
+                .iter()
+                .find(|(text, _)| text.contains("Committed oMG config"))
+                .expect("config heading");
+            assert!(
+                config.1.width() <= MG90_DETAIL_MAX_W + Style::SP_XL,
+                "MG90 config heading stretched to {} on a {width} display",
+                config.1.width()
+            );
+        }
+    }
+
     #[test]
     fn admin_section_strip_hit_targets_clamp_to_tiny_visible_lane() {
         let ctx = egui::Context::default();
@@ -7853,11 +7968,9 @@ mod tests {
         let no_gps_with_route = route_preview_start_readiness(true, true, false, &ready_status);
         assert_eq!(no_gps_with_route.button_label, "Waiting for GPS");
         assert!(!no_gps_with_route.can_start);
-        assert!(
-            no_gps_with_route
-                .tooltip
-                .contains("MG90 GNSS has no GPS fix")
-        );
+        assert!(no_gps_with_route
+            .tooltip
+            .contains("MG90 GNSS has no GPS fix"));
     }
 
     #[test]
@@ -7878,11 +7991,9 @@ mod tests {
             source.sample.longitude = -79.9959;
         }
         let blocked_texts = painted_texts(&mut blocked);
-        assert!(
-            blocked_texts
-                .iter()
-                .any(|text| text == "Navigation blocked")
-        );
+        assert!(blocked_texts
+            .iter()
+            .any(|text| text == "Navigation blocked"));
 
         let mut no_gps = MapsLocationSurface::simulated();
         no_gps.active = WorkspaceTab::Drive;
@@ -7897,11 +8008,9 @@ mod tests {
         let mut absent = MapsLocationSurface::live();
         absent.active = WorkspaceTab::Drive;
         let absent_texts = painted_texts(&mut absent);
-        assert!(
-            absent_texts
-                .iter()
-                .any(|text| text == "Radio & GNSS health")
-        );
+        assert!(absent_texts
+            .iter()
+            .any(|text| text == "Radio & GNSS health"));
         assert!(absent_texts.iter().any(|text| text == "Unavailable"));
         for label in [
             "Cell A",
@@ -7959,11 +8068,9 @@ mod tests {
         // The same rail remains in place once guidance is active.
         healthy.local_navigation.navigating = true;
         let active_route_texts = painted_texts(&mut healthy);
-        assert!(
-            active_route_texts
-                .iter()
-                .any(|text| text == "Radio & GNSS health")
-        );
+        assert!(active_route_texts
+            .iter()
+            .any(|text| text == "Radio & GNSS health"));
         assert!(active_route_texts.iter().any(|text| text == "Current"));
     }
 
@@ -8403,11 +8510,9 @@ mod tests {
             &simulated.vehicle_radio_health,
             &simulated.vehicle_mirror_status,
         );
-        assert!(
-            simulated_texts
-                .iter()
-                .any(|text| text == "simulated CAN/OBD profile")
-        );
+        assert!(simulated_texts
+            .iter()
+            .any(|text| text == "simulated CAN/OBD profile"));
         for fabricated in ["27", "1840", "91", "13.9", "64%", "78214 mi", "42 min"] {
             assert!(
                 !simulated_texts.iter().any(|text| text == fabricated),
@@ -8459,22 +8564,16 @@ mod tests {
             &live.vehicle_radio_health,
             &live.vehicle_mirror_status,
         );
-        assert!(
-            stale_texts
-                .iter()
-                .any(|text| text.starts_with("live vehicle-gateway mirror"))
-        );
+        assert!(stale_texts
+            .iter()
+            .any(|text| text.starts_with("live vehicle-gateway mirror")));
         assert!(stale_texts.iter().any(|text| text == "Stale retained"));
-        assert!(
-            stale_texts
-                .iter()
-                .any(|text| text == "cached values retained")
-        );
-        assert!(
-            stale_texts
-                .iter()
-                .any(|text| text.ends_with(" s ago") && text != "0.0 s ago")
-        );
+        assert!(stale_texts
+            .iter()
+            .any(|text| text == "cached values retained"));
+        assert!(stale_texts
+            .iter()
+            .any(|text| text.ends_with(" s ago") && text != "0.0 s ago"));
         for stale in ["62", "2100", "91", "13.9", "64%", "78214 mi", "42 min"] {
             assert!(
                 !stale_texts.iter().any(|text| text == stale),
@@ -8536,11 +8635,9 @@ mod tests {
             &empty.vehicle_mirror_status,
         );
         assert!(unavailable.iter().any(|text| text == "unavailable"));
-        assert!(
-            unavailable
-                .iter()
-                .any(|text| text.contains("No valid typed radio inventory"))
-        );
+        assert!(unavailable
+            .iter()
+            .any(|text| text.contains("No valid typed radio inventory")));
     }
 
     #[test]
@@ -8645,12 +8742,10 @@ mod tests {
             source.sample.speed_mph = f32::NAN;
             source.sample.heading_deg = f32::INFINITY;
         }
-        assert!(
-            !surface
-                .locations
-                .primary_sample()
-                .is_some_and(LocationSample::has_fix)
-        );
+        assert!(!surface
+            .locations
+            .primary_sample()
+            .is_some_and(LocationSample::has_fix));
         assert!(tessellate(&mut surface) > 0);
     }
 

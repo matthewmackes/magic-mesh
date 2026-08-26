@@ -102,20 +102,20 @@ use std::time::{Duration, Instant};
 
 use mde_egui::nav_chrome::AppFrame;
 use mde_egui::search_omnibox::SearchItem;
-use mde_egui::{LayoutProfile, Motion, Style, eframe, egui, run_client};
+use mde_egui::{eframe, egui, run_client, LayoutProfile, Motion, Style};
 use mde_seat::hotkeys::HotkeyAction;
 use mde_seat::{Probe, SeatSnapshot};
 use mde_theme::brand::icons::IconId;
 
-use mde_files_egui::{FileBrowser, files_panel, model::SurfaceTab};
-use mde_maps_location_egui::{MapsLocationSurface, maps_location_panel, real_maps_location};
+use mde_files_egui::{files_panel, model::SurfaceTab, FileBrowser};
+use mde_maps_location_egui::{maps_location_panel, real_maps_location, MapsLocationSurface};
 use mde_media_egui::{
-    MediaSurface, VideoTextureCache, media_header, media_panel, media_pump, real_media,
+    media_header, media_panel, media_pump, real_media, MediaSurface, VideoTextureCache,
 };
-use mde_music_egui::{MusicApp, music_pump, music_workspace};
-use mde_term_egui::{TerminalSurface, real_terminal, terminal_panel, terminal_pump};
+use mde_music_egui::{music_pump, music_workspace, MusicApp};
+use mde_term_egui::{real_terminal, terminal_panel, terminal_pump, TerminalSurface};
 
-use surfaces::{Surface, canonical_workspace_surface};
+use surfaces::{canonical_workspace_surface, Surface};
 use web::MediaTransportAction;
 // CURTAIN-3 — the logind lock-signal receive seam, so `render` can poll the
 // listener source for `loginctl lock-session` (the trait's `poll`).
@@ -155,6 +155,36 @@ const LAYOUT_MODE_GAP: f32 = Style::SP_S;
 const LAYOUT_MODE_TASKBAR_H: f32 = 48.0;
 const LAYOUT_MODE_TASKBAR_RIGHT_RESERVE: f32 = Style::SP_XL * 10.0;
 const LAYOUT_MODE_MIN_FLOATING_W: f32 = 500.0;
+
+/// Below this width (or when accessibility zoom exceeds
+/// [`SHELL_SETTINGS_LARGE_TEXT_ZOOM`]) Control Panel stacks the category
+/// picker above the detail pane. Laptop seats sit near this band; a 1080p
+/// HDMI TV is well above it and must keep a bounded wide split.
+const SHELL_SETTINGS_WIDE_MIN_W: f32 = 900.0;
+/// Accessibility zoom that forces the stacked Control Panel. Matches the
+/// existing large-text concession used by This Node / Workers.
+const SHELL_SETTINGS_LARGE_TEXT_ZOOM: f32 = 1.1;
+/// Fixed category rail so a large external display cannot let the catalog
+/// `ScrollArea` consume the whole scanout (the destination then paints
+/// off-screen). Token-derived from the same `SP_XL * n` rail idiom.
+const SHELL_SETTINGS_RAIL_W: f32 = Style::SP_XL * 9.0;
+/// Detail/reading width. Unbounded `available_width` stretches SETTINGS-3
+/// tiles and Overview cards across a 1920–3840 HDMI seat.
+const SHELL_SETTINGS_DETAIL_MAX_W: f32 = Style::SP_XL * 32.0;
+
+fn shell_settings_is_narrow(ui: &egui::Ui) -> bool {
+    ui.available_width() < SHELL_SETTINGS_WIDE_MIN_W
+        || ui.ctx().zoom_factor() > SHELL_SETTINGS_LARGE_TEXT_ZOOM
+}
+
+fn shell_settings_wide_split_widths(available: f32) -> (f32, f32) {
+    let rail = SHELL_SETTINGS_RAIL_W.min((available * 0.4).max(Style::SP_XL * 7.0));
+    let gutter = Style::SP_M * 2.0 + 1.0;
+    let detail = (available - rail - gutter)
+        .min(SHELL_SETTINGS_DETAIL_MAX_W)
+        .max(1.0);
+    (rail, detail)
+}
 
 /// The shell's pure navigation state: whether the shell body (the active
 /// surface) is showing over the session view, and which plane the Workbench has
@@ -2331,20 +2361,40 @@ impl Shell {
         ui.push_id("shell-workers", |ui| {
             let _ = AppFrame::new("Control Panel").leading_title().show(ui);
             ui.add_space(Style::SP_S);
-            let narrow = ui.available_width() < 900.0 || ui.ctx().zoom_factor() > 1.1;
-            if narrow {
+            if shell_settings_is_narrow(ui) {
                 self.show_workers_compact_picker(ui, &entries, &mut destination);
                 ui.separator();
+                ui.set_max_width(
+                    ui.available_width()
+                        .min(SHELL_SETTINGS_DETAIL_MAX_W)
+                        .max(1.0),
+                );
+                self.show_workers_destination(ui, &mut destination);
             } else {
+                let (rail_w, detail_w) = shell_settings_wide_split_widths(ui.available_width());
+                let height = ui.available_height().max(1.0);
                 ui.horizontal_top(|ui| {
-                    ui.vertical(|ui| self.show_workers_catalog(ui, &entries, &mut destination));
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(rail_w, height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_width(rail_w);
+                            ui.set_max_width(rail_w);
+                            self.show_workers_catalog(ui, &entries, &mut destination);
+                        },
+                    );
                     ui.separator();
                     ui.add_space(Style::SP_M);
-                    ui.vertical(|ui| self.show_workers_destination(ui, &mut destination));
+                    ui.allocate_ui_with_layout(
+                        egui::vec2(detail_w, height),
+                        egui::Layout::top_down(egui::Align::Min),
+                        |ui| {
+                            ui.set_max_width(detail_w);
+                            self.show_workers_destination(ui, &mut destination);
+                        },
+                    );
                 });
-                return;
             }
-            self.show_workers_destination(ui, &mut destination);
         });
         self.workers_destination = destination;
     }
@@ -2355,7 +2405,7 @@ impl Shell {
         entries: &[CatalogEntry],
         selected: &mut WorkersDestination,
     ) {
-        ui.set_min_width(Style::SP_XL * 8.0);
+        ui.set_width(ui.available_width().min(SHELL_SETTINGS_RAIL_W).max(1.0));
         let selected_group = workers_catalog::group(*selected);
         egui::ScrollArea::vertical()
             .id_salt("workers-category-rail")
@@ -2545,7 +2595,11 @@ impl Shell {
             CatalogGroup::ConnectedDevices,
             CatalogGroup::Advanced,
         ];
-        let columns = if ui.available_width() >= 900.0 { 2 } else { 1 };
+        let columns = if ui.available_width() >= SHELL_SETTINGS_WIDE_MIN_W {
+            2
+        } else {
+            1
+        };
         for row in groups.chunks(columns) {
             ui.columns(columns, |panes| {
                 for (pane, group) in panes.iter_mut().zip(row.iter().copied()) {
@@ -2649,7 +2703,7 @@ impl Shell {
                     ui.separator();
                     ui.add_space(Style::SP_S);
 
-                    let compact = ui.available_width() < 900.0 || ui.ctx().zoom_factor() > 1.1;
+                    let compact = shell_settings_is_narrow(ui);
                     if compact {
                         Self::show_this_node_search(ui, &mut self.this_node_search);
                         Self::show_this_node_tree(
@@ -2660,37 +2714,55 @@ impl Shell {
                             &self.thisnode,
                         );
                         ui.separator();
+                        ui.set_max_width(
+                            ui.available_width()
+                                .min(SHELL_SETTINGS_DETAIL_MAX_W)
+                                .max(1.0),
+                        );
                         self.show_this_node_workspace(ui, &mut tab, &mut section, &mut page);
                     } else {
+                        let (rail_w, detail_w) =
+                            shell_settings_wide_split_widths(ui.available_width());
+                        let height = ui.available_height().max(1.0);
                         ui.horizontal_top(|ui| {
-                            ui.vertical(|ui| {
-                                ui.set_min_width(Style::SP_XL * 7.0);
-                                Self::show_this_node_search(ui, &mut self.this_node_search);
-                                ui.add_space(Style::SP_XS);
-                                egui::ScrollArea::vertical()
-                                    .id_salt("this-node-navigation-rail")
-                                    .max_height(ui.available_height())
-                                    .show(ui, |ui| {
-                                        Self::show_this_node_tree(
-                                            ui,
-                                            &mut section,
-                                            &mut page,
-                                            &self.this_node_search,
-                                            &self.thisnode,
-                                        );
-                                    });
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(rail_w, height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_width(rail_w);
+                                    ui.set_max_width(rail_w);
+                                    Self::show_this_node_search(ui, &mut self.this_node_search);
+                                    ui.add_space(Style::SP_XS);
+                                    egui::ScrollArea::vertical()
+                                        .id_salt("this-node-navigation-rail")
+                                        .max_height(ui.available_height())
+                                        .show(ui, |ui| {
+                                            Self::show_this_node_tree(
+                                                ui,
+                                                &mut section,
+                                                &mut page,
+                                                &self.this_node_search,
+                                                &self.thisnode,
+                                            );
+                                        });
+                                },
+                            );
                             ui.add_space(Style::SP_M);
                             ui.separator();
                             ui.add_space(Style::SP_M);
-                            ui.vertical(|ui| {
-                                self.show_this_node_workspace(
-                                    ui,
-                                    &mut tab,
-                                    &mut section,
-                                    &mut page,
-                                );
-                            });
+                            ui.allocate_ui_with_layout(
+                                egui::vec2(detail_w, height),
+                                egui::Layout::top_down(egui::Align::Min),
+                                |ui| {
+                                    ui.set_max_width(detail_w);
+                                    self.show_this_node_workspace(
+                                        ui,
+                                        &mut tab,
+                                        &mut section,
+                                        &mut page,
+                                    );
+                                },
+                            );
                         });
                     }
                 });
@@ -2707,6 +2779,11 @@ impl Shell {
         section: &mut this_node_catalog::Section,
         page: &mut this_node_catalog::PageEntry,
     ) {
+        ui.set_max_width(
+            ui.available_width()
+                .min(SHELL_SETTINGS_DETAIL_MAX_W)
+                .max(1.0),
+        );
         if self.thisnode.actions_selected() {
             ui.separator();
             self.thisnode.show_actions_with_system(ui, &mut self.system);
@@ -5078,23 +5155,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Boot, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH, LAYOUT_MODE_HOLD,
-        LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H, LAYOUT_MODE_TASKBAR_RIGHT_RESERVE,
-        MENU_BAR_MINIMIZE_DURATION, MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab,
-        VideoTextureCache, WorkersDestination, WorkersTab, car_home, car_home_vehicle_glance,
-        car_keymap, chat, complete_menu_bar_minimize, console, construct, datacenter,
-        desktop_reconnect_should_query_recents, files_panel, front_door, front_door_peer_apps,
-        install_layout_mode_button_accessibility, install_layout_profile_row_accessibility,
-        layout_mode_button_accesskit_value, layout_mode_button_rect, layout_mode_control_visible,
-        layout_mode_menu_rect, layout_mode_primary_toggle, layout_profile_row_accesskit_value,
-        layout_profile_tooltip, matching_this_node_groups, media_header, media_panel,
-        menu_bar_shuffle_cards, menu_bar_shuffle_paint_order, music_browse_topic, nav_bar,
-        nav_bar_action_label, paint_car_speedometer, paint_car_status_tile,
-        publish_front_door_instance_lifecycle_to_bus, publish_front_door_peer_app_launch_to_bus,
-        publish_front_door_service_lifecycle_to_bus, real_media, real_terminal,
-        remote_sessions_fallback_pos, route_file_operation_request, screenshot, splash, status,
+        car_home, car_home_vehicle_glance, car_keymap, chat, complete_menu_bar_minimize, console,
+        construct, datacenter, desktop_reconnect_should_query_recents, files_panel, front_door,
+        front_door_peer_apps, install_layout_mode_button_accessibility,
+        install_layout_profile_row_accessibility, layout_mode_button_accesskit_value,
+        layout_mode_button_rect, layout_mode_control_visible, layout_mode_menu_rect,
+        layout_mode_primary_toggle, layout_profile_row_accesskit_value, layout_profile_tooltip,
+        matching_this_node_groups, media_header, media_panel, menu_bar_shuffle_cards,
+        menu_bar_shuffle_paint_order, music_browse_topic, nav_bar, nav_bar_action_label,
+        paint_car_speedometer, paint_car_status_tile, publish_front_door_instance_lifecycle_to_bus,
+        publish_front_door_peer_app_launch_to_bus, publish_front_door_service_lifecycle_to_bus,
+        real_media, real_terminal, remote_sessions_fallback_pos, route_file_operation_request,
+        screenshot, shell_settings_wide_split_widths, splash, status,
         surface_needs_remote_sessions_fallback, terminal_panel, this_node_search_is_compact,
-        this_node_system_route, this_node_system_section, toast_bridge, vdi,
+        this_node_system_route, this_node_system_section, toast_bridge, vdi, Boot,
+        MenuBarMinimizeEffect, Nav, Plane, Shell, Surface, ThisNodeTab, VideoTextureCache,
+        WorkersDestination, WorkersTab, LAYOUT_MODE_BUTTON_CONSTRUCT, LAYOUT_MODE_BUTTON_TOUCH,
+        LAYOUT_MODE_HOLD, LAYOUT_MODE_MIN_FLOATING_W, LAYOUT_MODE_TASKBAR_H,
+        LAYOUT_MODE_TASKBAR_RIGHT_RESERVE, MENU_BAR_MINIMIZE_DURATION, SHELL_SETTINGS_DETAIL_MAX_W,
+        SHELL_SETTINGS_RAIL_W,
     };
     use crate::this_node_catalog::{self, Section, SectionGroup};
     use mde_bus::hooks::config::Priority;
@@ -5103,7 +5182,7 @@ mod tests {
         AlertAction, AlertActionKind, Contact, Conversation, Message, MessageKind, NodeRole,
         Roster, Severity,
     };
-    use mde_egui::egui::{self, Rect, pos2, vec2};
+    use mde_egui::egui::{self, pos2, vec2, Rect};
     use mde_egui::{LayoutProfile, Style, StyleColorScheme};
     use mde_files::backend::{
         AuditEntry, Backend, BackendError, ConflictPolicy, Destination, SendMode,
@@ -5332,7 +5411,7 @@ mod tests {
 
     #[test]
     fn unified_this_node_child_routes_keep_their_detail_authority() {
-        use crate::this_node_catalog::{Section, first_page_for_section, page_for_route};
+        use crate::this_node_catalog::{first_page_for_section, page_for_route, Section};
 
         assert_eq!(
             first_page_for_section(Section::Hardware)
@@ -5388,6 +5467,31 @@ mod tests {
             match shape {
                 egui::Shape::Text(text) => {
                     out.push((text.galley.text().to_owned(), text_color(text)));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn painted_text_rects(shapes: &[egui::epaint::ClippedShape]) -> Vec<(String, Rect)> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, Rect)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((
+                        text.galley.text().to_owned(),
+                        Rect::from_min_size(text.pos, text.galley.size()),
+                    ));
                 }
                 egui::Shape::Vec(shapes) => {
                     for shape in shapes {
@@ -7386,6 +7490,90 @@ mod tests {
     }
 
     #[test]
+    fn shell_settings_wide_split_keeps_rail_and_detail_on_a_large_hdmi_seat() {
+        let (rail, detail) = shell_settings_wide_split_widths(1920.0);
+        assert_eq!(rail, SHELL_SETTINGS_RAIL_W);
+        assert_eq!(detail, SHELL_SETTINGS_DETAIL_MAX_W);
+        assert!(
+            rail + detail < 1920.0,
+            "wide split must leave unused scanout on a 1080p HDMI TV instead of stretching"
+        );
+        let (laptop_rail, laptop_detail) = shell_settings_wide_split_widths(1366.0);
+        assert_eq!(laptop_rail, SHELL_SETTINGS_RAIL_W);
+        assert!(
+            laptop_detail <= SHELL_SETTINGS_DETAIL_MAX_W,
+            "laptop detail pane must not exceed the reading width"
+        );
+        assert!(
+            laptop_rail + laptop_detail < 1366.0,
+            "laptop split must still fit the 1366 logical seat"
+        );
+    }
+
+    #[test]
+    fn workers_control_panel_stays_on_screen_on_large_external_display() {
+        for width in [1366.0, 1920.0, 2560.0, 3840.0] {
+            let ctx = egui::Context::default();
+            Style::install(&ctx);
+            let mut shell = Shell::new_for_ctx(&ctx);
+            shell.nav.expanded = true;
+            shell.nav.surface = Surface::Workers;
+            let height = 1080.0;
+            let out = ctx.run(
+                egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(width, height))),
+                    ..Default::default()
+                },
+                |ctx| {
+                    egui::CentralPanel::default().show(ctx, |ui| {
+                        ui.push_id("shell-workers-large", |ui| shell.show_workers(ui));
+                    });
+                },
+            );
+            let primitives = ctx.tessellate(out.shapes.clone(), out.pixels_per_point);
+            assert!(
+                !primitives.is_empty(),
+                "Control Panel did not paint at width={width}"
+            );
+            let texts = painted_text_rects(&out.shapes);
+            assert!(
+                texts.iter().any(|(text, _)| text == "Control Panel"),
+                "Control Panel title is missing at width={width}"
+            );
+            assert!(
+                texts
+                    .iter()
+                    .any(|(text, _)| text.contains("Choose a control area")),
+                "Control Panel overview body is missing at width={width}"
+            );
+            for (text, rect) in &texts {
+                assert!(
+                    rect.right() <= width + 1.0 && rect.bottom() <= height + 1.0,
+                    "Control Panel {text:?} paints off-screen at width={width}: {rect:?}"
+                );
+            }
+            let choose = texts
+                .iter()
+                .find(|(text, _)| text.contains("Choose a control area"))
+                .expect("overview caption");
+            assert!(
+                choose.1.width() <= SHELL_SETTINGS_DETAIL_MAX_W + Style::SP_XL,
+                "overview caption stretched to {} on a {width} display",
+                choose.1.width()
+            );
+            let this_node_left = texts
+                .iter()
+                .filter(|(text, _)| text.as_str() == "This Node")
+                .map(|(_, rect)| rect.left())
+                .fold(f32::MAX, f32::min);
+            assert!(
+                this_node_left < SHELL_SETTINGS_RAIL_W + Style::SP_XL,
+                "This Node catalog rail started at {this_node_left} instead of the left rail at width={width}"
+            );
+        }
+    }
+
+    #[test]
     fn unified_this_node_actions_workspace_is_reachable_and_reflows() {
         for (width, zoom) in [(960.0, 1.0), (480.0, 1.0), (960.0, 1.5)] {
             let ctx = egui::Context::default();
@@ -7464,7 +7652,7 @@ mod tests {
             .expect("seed source file");
 
         let rows = vec![
-            FileRow::local("report.txt", Mime::Doc, "6 B", "now").with_path("/src/report.txt"),
+            FileRow::local("report.txt", Mime::Doc, "6 B", "now").with_path("/src/report.txt")
         ];
         let mut files = mde_files_egui::FileBrowser::with_file_ops(
             Box::new(ShellFilesBackend::new(rows)),
@@ -8342,12 +8530,10 @@ mod tests {
             body["schema_version"],
             mackes_mesh_types::workloads::WORKLOAD_CONTRACT_SCHEMA_VERSION
         );
-        assert!(
-            mackes_mesh_types::cloud::CloudArmedToken::parse(
-                body["armed_token"].as_str().expect("armed token")
-            )
-            .is_some()
-        );
+        assert!(mackes_mesh_types::cloud::CloudArmedToken::parse(
+            body["armed_token"].as_str().expect("armed token")
+        )
+        .is_some());
         assert!(
             publish_front_door_instance_lifecycle_to_bus(
                 dir.path(),

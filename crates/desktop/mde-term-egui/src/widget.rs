@@ -1797,6 +1797,18 @@ const fn watch_badge(mode: WatchMode) -> Option<(&'static str, egui::Color32)> {
 
 // ── Pure geometry / encoding folds (unit-tested without a UI) ───────────────
 
+/// Extra letter spacing that makes a laid-out run occupy exactly `cells`
+/// grid cells. Wide HDMI seats expose drift that 80-column laptop grids hide:
+/// a 160-column ASCII run whose galley is 1% off the `'M'` cell width lands
+/// several cells away from the cursor and selection overlay.
+pub(crate) fn letter_spacing_for_cell_grid(natural_width: f32, cells: usize, cell_w: f32) -> f32 {
+    if cells <= 1 {
+        return 0.0;
+    }
+    let target = cells as f32 * cell_w.max(1.0);
+    (target - natural_width) / (cells - 1) as f32
+}
+
 /// Grid dimensions for an available rect: floor division by the cell metrics,
 /// at least 1×1. A milli-cell epsilon absorbs f32 ratio noise so a rect sized
 /// for exactly N cells yields N (960.0/9.6 is 99.999992…, not 100).
@@ -2156,6 +2168,7 @@ fn paint_row(painter: &egui::Painter, origin: Pos2, spec: &PaintSpec, row: usize
                 font_id: spec.font_id.clone(),
                 color: style.fg,
                 italics: style.italic,
+                extra_letter_spacing: 0.0,
                 ..TextFormat::default()
             };
             if style.underline {
@@ -2164,8 +2177,42 @@ fn paint_row(painter: &egui::Painter, origin: Pos2, spec: &PaintSpec, row: usize
             if style.strikeout {
                 format.strikethrough = Stroke::new(1.0, style.fg);
             }
-            let galley = painter.layout_job(LayoutJob::single_section(text, format));
-            painter.galley(run.min, galley, style.fg);
+            let cells = run_end - col;
+            let cell_format = format.clone();
+            let mut galley =
+                painter.layout_job(LayoutJob::single_section(text.clone(), format.clone()));
+            let target = cells as f32 * spec.cell.x;
+            if cells > 1 {
+                let spacing = letter_spacing_for_cell_grid(galley.size().x, cells, spec.cell.x);
+                if spacing.abs() > 0.05 {
+                    format.extra_letter_spacing = spacing;
+                    let mut job = LayoutJob::simple(
+                        text.clone(),
+                        spec.font_id.clone(),
+                        style.fg,
+                        f32::INFINITY,
+                    );
+                    if let Some(section) = job.sections.first_mut() {
+                        section.format = format;
+                    }
+                    galley = painter.layout_job(job);
+                }
+            }
+            if cells > 1 && (galley.size().x - target).abs() > 1.5 {
+                for (i, ch) in text.chars().enumerate() {
+                    if ch == ' ' && !style.underline && !style.strikeout {
+                        continue;
+                    }
+                    let pos = Pos2::new(run.min.x + i as f32 * spec.cell.x, run.min.y);
+                    let glyph = painter.layout_job(LayoutJob::single_section(
+                        ch.to_string(),
+                        cell_format.clone(),
+                    ));
+                    painter.galley(pos, glyph, style.fg);
+                }
+            } else {
+                painter.galley(run.min, galley, style.fg);
+            }
         }
         col = run_end;
     }
@@ -2439,6 +2486,112 @@ mod tests {
         // Never below 1×1, and degenerate cell metrics can't divide by zero.
         assert_eq!(grid_size(vec2(3.0, 2.0), vec2(9.6, 20.0)), (1, 1));
         assert_eq!(grid_size(vec2(100.0, 100.0), vec2(0.0, 0.0)), (100, 100));
+    }
+
+    #[test]
+    fn letter_spacing_locks_a_wide_run_to_the_cell_grid() {
+        assert_eq!(letter_spacing_for_cell_grid(800.0, 100, 8.0), 0.0);
+        assert_eq!(letter_spacing_for_cell_grid(80.0, 1, 8.0), 0.0);
+        let spacing = letter_spacing_for_cell_grid(790.0, 100, 8.0);
+        assert!((spacing - 10.0 / 99.0).abs() < 1e-5);
+        let compressed = letter_spacing_for_cell_grid(820.0, 100, 8.0);
+        assert!((compressed + 20.0 / 99.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn paint_row_keeps_galley_width_on_the_cell_grid_on_a_wide_hdmi_seat() {
+        let mut term = Terminal::new(160, 2, 100);
+        let line = "abcdefghijklmnopqrstuvwxyz0123456789".repeat(5);
+        term.feed(line[..160].as_bytes());
+        let screen = term.viewport();
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let cell_w = std::cell::Cell::new(0.0_f32);
+        let out = ctx.run(
+            RawInput {
+                screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1920.0, 1080.0))),
+                ..RawInput::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    let font_id = FontId::monospace(Style::BODY);
+                    let cell = ui
+                        .fonts(|f| Vec2::new(f.glyph_width(&font_id, 'M'), f.row_height(&font_id)));
+                    cell_w.set(cell.x);
+                    let rect = ui.available_rect_before_wrap();
+                    paint_grid(
+                        &ui.painter_at(rect),
+                        rect,
+                        &screen,
+                        &plain_spec(font_id, cell),
+                    );
+                });
+            },
+        );
+        let mut galleys = Vec::new();
+        fn walk(shape: &egui::Shape, out: &mut Vec<(String, f32, f32)>) {
+            match shape {
+                egui::Shape::Text(text) => {
+                    out.push((
+                        text.galley.text().to_owned(),
+                        text.pos.x,
+                        text.galley.size().x,
+                    ));
+                }
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for clipped in &out.shapes {
+            walk(&clipped.shape, &mut galleys);
+        }
+        let target_cells = 160.0;
+        let cell = cell_w.get();
+        if let Some(run) = galleys
+            .iter()
+            .find(|(text, _, _)| text.chars().count() >= 80)
+        {
+            let target = run.0.chars().count() as f32 * cell;
+            assert!(
+                (run.2 - target).abs() <= 1.5,
+                "wide HDMI run galley {} != {} ({} cells × {})",
+                run.2,
+                target,
+                run.0.chars().count(),
+                cell
+            );
+        } else {
+            let mut glyphs: Vec<(f32, f32)> = galleys
+                .iter()
+                .filter(|(text, _, _)| {
+                    text.chars().count() == 1 && text.chars().all(|ch| ch.is_ascii_alphanumeric())
+                })
+                .map(|(_, x, w)| (*x, *w))
+                .collect();
+            glyphs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+            assert!(
+                glyphs.len() >= 80,
+                "wide HDMI run missing (no batched galley and only {} cell glyphs)",
+                glyphs.len()
+            );
+            let first = glyphs.first().expect("glyph");
+            let last = glyphs.last().expect("glyph");
+            let span = last.0 - first.0;
+            let expected = (target_cells - 1.0) * cell;
+            assert!(
+                (span - expected).abs() <= 1.5,
+                "wide HDMI per-cell span {} != {} (160 cells × {}) first={} last={}",
+                span,
+                expected,
+                cell,
+                first.0,
+                last.0
+            );
+        }
     }
 
     #[test]
