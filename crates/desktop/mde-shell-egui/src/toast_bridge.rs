@@ -145,7 +145,7 @@ fn health_kiron_toast(alert: HealthKironAlert) -> Toast {
     let snapshot_generation = alert.snapshot_generation;
     Toast::alert(severity, alert.node, flag, alert.headline)
         .with_dwell(dwell)
-        .with_action("Open Control Panel", "shell/goto/workers")
+        .with_action("Open Health", "shell/goto/health")
         .with_health_authority(condition_id, snapshot_generation)
 }
 
@@ -555,6 +555,8 @@ pub(crate) enum Navigate {
     Workers(WorkersDestination),
     /// Open the Workbench on this plane.
     Plane(Plane),
+    /// Open the centered System and Mesh Health modal.
+    Health,
 }
 
 /// Resolve an opaque alert action `verb` to shell navigation. The verb grammar is
@@ -579,6 +581,9 @@ pub(crate) fn resolve_action(verb: &str) -> Option<Navigate> {
         }
         if name.eq_ignore_ascii_case("discovery") {
             return Some(Navigate::Workers(WorkersDestination::Discovery));
+        }
+        if name.eq_ignore_ascii_case("health") {
+            return Some(Navigate::Health);
         }
         return surface_by_name(name).map(Navigate::Surface);
     }
@@ -1417,7 +1422,11 @@ mod tests {
         assert_eq!(grade_d.flag, "HEALTH · GRADE D · 1m 10s · nvme0n1");
         assert_eq!(
             grade_d.action.as_ref().map(|action| action.verb.as_str()),
-            Some("shell/goto/workers")
+            Some("shell/goto/health")
+        );
+        assert_eq!(
+            grade_d.action.as_ref().map(|action| action.label.as_str()),
+            Some("Open Health")
         );
 
         let grade_e = decode(&health_kiron_body(GradeLetter::E)).expect("grade E admitted");
@@ -1641,6 +1650,10 @@ mod tests {
         assert!(matches!(
             resolve_action("shell/goto/mesh-map"),
             Some(Navigate::Workers(WorkersDestination::MeshMap))
+        ));
+        assert!(matches!(
+            resolve_action("shell/goto/health"),
+            Some(Navigate::Health)
         ));
         for retired in ["meshview", "mesh"] {
             assert!(

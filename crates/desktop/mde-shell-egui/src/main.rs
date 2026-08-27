@@ -1428,6 +1428,10 @@ impl Shell {
                 self.fleet_mesh_tab = FleetMeshTab::Workbench;
                 self.nav.plane = plane;
             }
+            toast_bridge::Navigate::Health => {
+                self.construct.open_health();
+                self.construct.health_selected_node = Some(crate::explorer::local_hostname());
+            }
         }
     }
 
@@ -2314,6 +2318,10 @@ impl Shell {
                 self.workers_tab = WorkersTab::Control;
                 self.fleet_mesh_tab = FleetMeshTab::Workbench;
                 self.nav.plane = plane;
+            }
+            toast_bridge::Navigate::Health => {
+                self.construct.open_health();
+                self.construct.health_selected_node = Some(crate::explorer::local_hostname());
             }
         }
     }

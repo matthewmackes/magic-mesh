@@ -192,11 +192,7 @@ fn show(
     let admitted_snapshot = admit_modal_snapshot(ui.ctx(), snapshot);
     let snapshot = admitted_snapshot.as_ref();
     stabilize_selection(chrome, snapshot);
-    let active = active_condition_count(snapshot);
-    let issue_text = format!(
-        "{active} active {}",
-        if active == 1 { "issue" } else { "issues" }
-    );
+    let (issue_text, issue_color) = issue_header_copy(snapshot);
     let compact_header = ui.available_width() < 700.0;
     ui.horizontal(|ui| {
         ui.heading("System and Mesh Health");
@@ -214,11 +210,7 @@ fn show(
         });
     });
     ui.horizontal(|ui| {
-        ui.label(egui::RichText::new(issue_text).color(if active == 0 {
-            Style::SUPPORT_SUCCESS
-        } else {
-            Style::SUPPORT_WARNING
-        }));
+        ui.label(egui::RichText::new(issue_text).color(issue_color));
         if compact_header {
             if let Some(snapshot) = snapshot {
                 ui.label(format!("Overall {}", snapshot.mesh_summary.grade.as_str()));
@@ -343,10 +335,13 @@ fn admit_modal_snapshot(
 /// asynchronously refreshed roster silently move the evidence pane.
 fn stabilize_selection(chrome: &mut ConstructChrome, snapshot: Option<&SystemMeshHealthSnapshot>) {
     if chrome.health_selected_node.is_none() {
+        let local = crate::explorer::local_hostname();
         chrome.health_selected_node = snapshot.and_then(|snapshot| {
             snapshot
                 .current_node_grades
-                .first()
+                .iter()
+                .find(|grade| grade.node == local)
+                .or_else(|| snapshot.current_node_grades.first())
                 .map(|grade| grade.node.clone())
         });
     }
@@ -517,17 +512,66 @@ fn status_cell_state(
 }
 
 fn active_condition_count(snapshot: Option<&SystemMeshHealthSnapshot>) -> usize {
-    snapshot.map_or(0, |snapshot| {
-        snapshot
-            .active_conditions
-            .iter()
-            .filter(|condition| {
-                condition.is_active()
-                    && condition.requirement
-                        == mackes_mesh_types::health::RequirementClass::Required
-            })
-            .count()
-    })
+    snapshot.map_or(0, |snapshot| required_active_conditions(snapshot).len())
+}
+
+/// Missing evidence must not be painted as a healthy zero. The taskbar already
+/// says "evidence stale"; the modal header has to stay on that side of the
+/// contract when the chrome projection is absent.
+fn issue_header_copy(snapshot: Option<&SystemMeshHealthSnapshot>) -> (String, egui::Color32) {
+    match snapshot {
+        None => (
+            "Health evidence is not current".into(),
+            Style::SUPPORT_WARNING,
+        ),
+        Some(snapshot) => {
+            let active = required_active_conditions(snapshot).len();
+            if active == 0 {
+                ("0 active issues".into(), Style::SUPPORT_SUCCESS)
+            } else {
+                (
+                    format!(
+                        "{active} active {}",
+                        if active == 1 { "issue" } else { "issues" }
+                    ),
+                    Style::SUPPORT_WARNING,
+                )
+            }
+        }
+    }
+}
+
+fn required_active_conditions(snapshot: &SystemMeshHealthSnapshot) -> Vec<&HealthCondition> {
+    let mut conditions: Vec<_> = snapshot
+        .active_conditions
+        .iter()
+        .filter(|condition| {
+            condition.is_active()
+                && condition.requirement == mackes_mesh_types::health::RequirementClass::Required
+        })
+        .collect();
+    conditions.sort_by(|left, right| {
+        right
+            .severity
+            .cmp(&left.severity)
+            .then_with(|| scope_sort_key(&left.scope).cmp(&scope_sort_key(&right.scope)))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+    conditions
+}
+
+fn scope_sort_key(scope: &HealthScope) -> (u8, &str) {
+    match scope {
+        HealthScope::Mesh => (0, ""),
+        HealthScope::Node { node } => (1, node.as_str()),
+    }
+}
+
+fn condition_action_node(condition: &HealthCondition) -> &str {
+    match &condition.scope {
+        HealthScope::Node { node } => node.as_str(),
+        HealthScope::Mesh => MESH_SELECTION,
+    }
 }
 
 fn detail(
@@ -551,20 +595,20 @@ fn detail(
                 snapshot.mesh_summary.canonical_nodes,
                 snapshot.mesh_summary.reachable_lighthouses,
             ));
-            let conditions: Vec<_> = snapshot
-                .active_conditions
-                .iter()
-                .filter(|condition| {
-                    condition.scope == HealthScope::Mesh
-                        && condition.requirement
-                            == mackes_mesh_types::health::RequirementClass::Required
-                })
-                .collect();
+            ui.strong("Active Issues");
+            let conditions = required_active_conditions(snapshot);
             if conditions.is_empty() {
                 ui.colored_label(Style::SUPPORT_SUCCESS, "0 active issues");
+                ui.label("All required providers are current and within policy.");
             }
             for condition in conditions {
-                condition_card(ui, chrome, snapshot, condition, MESH_SELECTION);
+                condition_card(
+                    ui,
+                    chrome,
+                    snapshot,
+                    condition,
+                    condition_action_node(condition),
+                );
             }
         } else {
             ui.label("The health provider has not published a current mesh summary.");
@@ -600,8 +644,15 @@ fn detail(
         .collect();
     ui.strong("Active Issues");
     if conditions.is_empty() {
-        ui.colored_label(Style::SUPPORT_SUCCESS, "0 active issues");
-        ui.label("All required providers are current and within policy.");
+        if snapshot.is_none() {
+            ui.colored_label(Style::SUPPORT_WARNING, "Health evidence is not current");
+            ui.label("The health provider has not published a current seat row.");
+        } else if active_condition_count(snapshot) > 0 {
+            ui.label("This seat has no required conditions. Other nodes still have active issues.");
+        } else {
+            ui.colored_label(Style::SUPPORT_SUCCESS, "0 active issues");
+            ui.label("All required providers are current and within policy.");
+        }
     }
     for condition in conditions {
         condition_card(
@@ -2978,6 +3029,80 @@ mod tests {
             }],
         );
         assert!(!chrome.health_modal_open, "Escape closes the modal");
+    }
+
+    #[test]
+    fn missing_snapshot_does_not_report_a_healthy_zero() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut chrome = ConstructChrome::default();
+        chrome.health_modal_open = true;
+        let input = || egui::RawInput {
+            screen_rect: Some(egui::Rect::from_min_size(
+                egui::Pos2::ZERO,
+                egui::vec2(1_200.0, 800.0),
+            )),
+            ..Default::default()
+        };
+        let _ = ctx.run(input(), |ctx| mount(ctx, &mut chrome, None));
+        let output = ctx.run(input(), |ctx| mount(ctx, &mut chrome, None));
+        let text = painted_text(&output.shapes).join(" | ");
+        assert!(text.contains("System and Mesh Health"), "{text}");
+        assert!(
+            text.contains("Health evidence is not current"),
+            "absent chrome evidence must not look healthy: {text}"
+        );
+        assert!(
+            !text.contains("0 active issues"),
+            "a missing snapshot must not report a healthy zero: {text}"
+        );
+        assert!(
+            !text.contains("All required providers are current and within policy."),
+            "a missing snapshot must not claim policy is current: {text}"
+        );
+    }
+
+    #[test]
+    fn mesh_wide_reports_node_scoped_required_conditions() {
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let snapshot = fixture_snapshot(true, true);
+        let expected = snapshot.active_conditions[0].evidence.summary.clone();
+        let mut chrome = ConstructChrome::default();
+        chrome.health_modal_open = true;
+        chrome.health_selected_node = Some(MESH_SELECTION.into());
+        let _ = render_frame(
+            &ctx,
+            &mut chrome,
+            &snapshot,
+            egui::vec2(1_200.0, 800.0),
+            Vec::new(),
+        );
+        let output = render_frame(
+            &ctx,
+            &mut chrome,
+            &snapshot,
+            egui::vec2(1_200.0, 800.0),
+            Vec::new(),
+        );
+        let text = painted_text(&output.shapes).join(" | ");
+        assert!(text.contains("Mesh-wide"), "{text}");
+        assert!(
+            text.contains("11 active issues"),
+            "mesh-wide must keep the issue count when node conditions exist: {text}"
+        );
+        assert!(
+            !text.contains("0 active issues"),
+            "mesh-wide must not hide node-scoped required conditions as a healthy zero: {text}"
+        );
+        assert!(
+            text.contains(&expected),
+            "mesh-wide must paint the node-scoped evidence: {text}"
+        );
+        assert!(
+            !text.contains("All required providers are current and within policy."),
+            "mesh-wide must not claim a healthy mesh while node issues are open: {text}"
+        );
     }
 
     #[test]
