@@ -170,7 +170,8 @@ const fn transfer_ctrl_passes_through(surface: Option<Surface>, text_focus: bool
 /// Map a Ctrl-held named key to the catalog chord string. These fire on Construct
 /// chrome without Super. When Documents, Terminal, Desktop, or Browser have
 /// text / guest focus the catalog refuses the binding so the keystroke reaches
-/// the editor / PTY / guest.
+/// the editor / PTY / guest. Extra modifiers (Shift, Alt/AltGr) also refuse so
+/// the exact Ctrl+J / Ctrl+N chords cannot shadow text editing.
 const fn ctrl_chord(
     press: KeyPress,
     text_surface: Option<Surface>,
@@ -402,12 +403,12 @@ const fn nav_slot_for(key: egui::Key, shift: bool) -> Option<NavSlot> {
     Some(NavSlot(if shift { digit + 10 } else { digit }))
 }
 
-/// One egui key **press** with the **Shift** state that came with it. Shift is
-/// the only egui-side modifier the router reads — the Super leader arrives
-/// host-first (evdev 125/126, [`decode_scan`]), so a chord is the leader latch
+/// One egui key **press** with the modifiers the router reads. Super arrives
+/// host-first (evdev 125/126, [`decode_scan`]), so a leader chord is the latch
 /// crossed with a `(key, shift)` press. Shift selects the **second** Super-number
 /// nav tier (REACH-2): `Super+1..0` reaches the first ten slots and
 /// `Super+Shift+1..9/0` reaches the second ten, with bounds-safe overshoot.
+/// `ctrl` is the Transfers catalog bit (WL-FUNC-032): exact Ctrl, never AltGr.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct KeyPress {
     /// The pressed egui key.
@@ -415,13 +416,17 @@ pub(crate) struct KeyPress {
     /// Whether Shift was held for this press.
     pub(crate) shift: bool,
     /// Whether Ctrl was held for this press (Transfers chords, WL-FUNC-032).
+    ///
+    /// [`egui_key_presses`] clears this when Alt is also held so AltGr
+    /// (Ctrl+Alt on many layouts) cannot fire Ctrl+J / Ctrl+N.
     pub(crate) ctrl: bool,
 }
 
-/// The egui key **presses** in this frame's input (a press, not a release), the
-/// leader-chord half of the dispatch input, each carrying its Shift bit (the nav
-/// tier selector, REACH-2). Kept tiny so the shell's render can build it inline
-/// from `ctx.input`.
+/// The egui key **presses** in this frame's input (a press, not a release).
+/// Each carries Shift (the Super-number nav tier, REACH-2) and Ctrl (Transfers
+/// chords). AltGr is Ctrl+Alt on many layouts — that combination must not set
+/// `ctrl`, or Documents/Terminal text editing loses J/N. Kept tiny so the
+/// shell's render can build it inline from `ctx.input`.
 pub(crate) fn egui_key_presses(events: &[egui::Event]) -> Vec<KeyPress> {
     events
         .iter()
@@ -434,7 +439,8 @@ pub(crate) fn egui_key_presses(events: &[egui::Event]) -> Vec<KeyPress> {
             } => Some(KeyPress {
                 key: *key,
                 shift: modifiers.shift,
-                ctrl: modifiers.ctrl,
+                // Exact Ctrl: AltGr is Ctrl+Alt and must not claim J/N.
+                ctrl: modifiers.ctrl && !modifiers.alt,
             }),
             _ => None,
         })
@@ -710,6 +716,11 @@ mod tests {
             ctrl: true,
             ..Default::default()
         };
+        let altgr = egui::Modifiers {
+            ctrl: true,
+            alt: true,
+            ..Default::default()
+        };
         let events = vec![
             egui::Event::Key {
                 key: egui::Key::L,
@@ -734,6 +745,14 @@ mod tests {
                 repeat: false,
                 modifiers: ctrl,
             },
+            // AltGr is Ctrl+Alt: must not set the Transfers ctrl bit.
+            egui::Event::Key {
+                key: egui::Key::N,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: altgr,
+            },
             egui::Event::Key {
                 key: egui::Key::S,
                 physical_key: None,
@@ -749,6 +768,7 @@ mod tests {
                 press(egui::Key::L),
                 shift_press(egui::Key::Num1),
                 ctrl_press(egui::Key::J),
+                press(egui::Key::N),
             ]
         );
     }
@@ -1022,6 +1042,43 @@ mod tests {
         assert!(
             r.dispatch(&[], &[press(egui::Key::N)]).is_empty(),
             "bare N must never start a transfer"
+        );
+
+        // AltGr is Ctrl+Alt on many layouts. The live path is egui_key_presses;
+        // that filter must drop the Transfers ctrl bit so Documents/Terminal
+        // keep J/N. Direct KeyPress construction cannot carry Alt without a
+        // new field (apply-site tests own the current shape).
+        let altgr_j = egui::Event::Key {
+            key: egui::Key::J,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+        };
+        let altgr_n = egui::Event::Key {
+            key: egui::Key::N,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers {
+                ctrl: true,
+                alt: true,
+                ..Default::default()
+            },
+        };
+        let presses = egui_key_presses(&[altgr_j, altgr_n]);
+        assert_eq!(
+            presses,
+            vec![press(egui::Key::J), press(egui::Key::N)],
+            "AltGr must not set the Transfers ctrl bit"
+        );
+        assert!(
+            r.dispatch(&[], &presses).is_empty(),
+            "Ctrl+Alt+J / Ctrl+Alt+N must not open Transfers or start a transfer"
         );
     }
 

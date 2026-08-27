@@ -2353,6 +2353,34 @@ fn refuse_unprovisioned_voice(form: &mut VoiceAdminFormState) -> VoiceAdminFormO
     VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::NoProvisionedAccount)
 }
 
+/// Publish DID route/unroute from a retained inventory row. The row's number
+/// becomes the draft DID so the operator does not re-type a projected value.
+fn apply_voice_did_inventory_row(
+    form: &mut VoiceAdminFormState,
+    did: &VoiceDid,
+    unroute: bool,
+    nodes: &[VoiceNodeProjection],
+    dids: &[VoiceDid],
+    sink: &mut VoiceAdminSink,
+) -> VoiceAdminFormOutcome {
+    form.did.clone_from(&did.number);
+    apply_voice_did_route(form, nodes, dids, sink, unroute)
+}
+
+/// Publish failover for one fleet-board node. The row's `node_id` becomes the
+/// draft target so a projected hostname is never re-typed as a dest.
+fn apply_voice_node_failover(
+    form: &mut VoiceAdminFormState,
+    node_id: &str,
+    kind: usize,
+    nodes: &[VoiceNodeProjection],
+    sink: &mut VoiceAdminSink,
+) -> VoiceAdminFormOutcome {
+    form.failover_node = node_id.to_owned();
+    form.failover_kind = kind;
+    apply_voice_failover(form, nodes, sink)
+}
+
 fn apply_voice_did_route(
     form: &mut VoiceAdminFormState,
     nodes: &[VoiceNodeProjection],
@@ -2727,12 +2755,32 @@ fn voice_did_routing(
         let mut list = widgets::DenseList::new();
         for did in dids {
             list.row(ui, |ui| {
-                widgets::field(
-                    ui,
-                    &did.number,
-                    did.routed_to.as_deref().unwrap_or("main account"),
-                    theme_color(ui, Style::TEXT),
-                );
+                ui.horizontal_wrapped(|ui| {
+                    widgets::field(
+                        ui,
+                        &did.number,
+                        did.routed_to.as_deref().unwrap_or("main account"),
+                        theme_color(ui, Style::TEXT),
+                    );
+                    if did.routed_to.is_some() {
+                        if ui
+                            .button("Unroute")
+                            .comms_hover_text(
+                                "Return this projected DID to the master account main line",
+                            )
+                            .clicked()
+                        {
+                            let _ =
+                                apply_voice_did_inventory_row(form, did, true, nodes, dids, sink);
+                        }
+                    } else if ui
+                        .button("Route")
+                        .comms_hover_text("Route this projected DID to the selected fleet node")
+                        .clicked()
+                    {
+                        let _ = apply_voice_did_inventory_row(form, did, false, nodes, dids, sink);
+                    }
+                });
             });
         }
     }
@@ -2756,6 +2804,7 @@ fn voice_did_routing(
                 .desired_width(Style::SP_XL * 6.0)
                 .hint_text("peer:eagle or hostname"),
         );
+        voice_provisioned_node_chips(ui, &mut form.route_node, nodes);
         if ui.button("Route DID").clicked() {
             let _ = apply_voice_admin(
                 form,
@@ -2786,6 +2835,44 @@ fn voice_failover(
         Style::typography_text("Failover policy", TypographyRole::Title)
             .color(theme_color(ui, Style::TEXT_STRONG)),
     );
+    for node in nodes.iter().filter(|node| node.is_provisioned()) {
+        ui.horizontal_wrapped(|ui| {
+            widgets::status_dot(ui, theme_color(ui, voice_reg_tone(&node.reg_state)));
+            ui.label(
+                Style::typography_text(&node.hostname, TypographyRole::Caption)
+                    .color(theme_color(ui, Style::TEXT)),
+            );
+            let current = node
+                .failover
+                .as_ref()
+                .map_or_else(|| "—".to_owned(), VoiceFailoverPolicy::label);
+            ui.label(
+                Style::typography_text(current, TypographyRole::Caption)
+                    .color(theme_color(ui, Style::TEXT_DIM)),
+            );
+            if ui
+                .button("Voicemail")
+                .comms_hover_text("Publish action/voice/failover Voicemail for this node")
+                .clicked()
+            {
+                let _ = apply_voice_node_failover(form, &node.node_id, 0, nodes, sink);
+            }
+            if ui
+                .button("None")
+                .comms_hover_text("Publish action/voice/failover None for this node")
+                .clicked()
+            {
+                let _ = apply_voice_node_failover(form, &node.node_id, 2, nodes, sink);
+            }
+            if ui
+                .button("Forward")
+                .comms_hover_text("Publish action/voice/failover Forward using the number field")
+                .clicked()
+            {
+                let _ = apply_voice_node_failover(form, &node.node_id, 1, nodes, sink);
+            }
+        });
+    }
     ui.horizontal_wrapped(|ui| {
         ui.label(
             Style::typography_text("Node", TypographyRole::Caption)
@@ -2796,6 +2883,7 @@ fn voice_failover(
                 .desired_width(Style::SP_XL * 6.0)
                 .hint_text("peer:eagle or hostname"),
         );
+        voice_provisioned_node_chips(ui, &mut form.failover_node, nodes);
         for (index, label) in ["Voicemail", "Forward", "None"].into_iter().enumerate() {
             if ui
                 .selectable_label(form.failover_kind == index, label)
@@ -2830,6 +2918,7 @@ fn voice_shared_outbound(
     );
     match shared {
         Some(config) => {
+            widgets::field(ui, "Shared outbound", "Lifted", theme_color(ui, Style::OK));
             widgets::field(
                 ui,
                 "Caller ID in force",
@@ -2844,6 +2933,12 @@ fn voice_shared_outbound(
             );
         }
         None => {
+            widgets::field(
+                ui,
+                "Shared outbound",
+                "Not lifted",
+                theme_color(ui, Style::WARN),
+            );
             widgets::muted_note(ui, EMPTY_VOICE_SHARED_NOTE);
         }
     }
@@ -2866,8 +2961,13 @@ fn voice_shared_outbound(
                 .desired_width(Style::SP_XL * 5.0)
                 .hint_text("main"),
         );
+        let lift_label = if shared.is_some() {
+            "Apply to fleet"
+        } else {
+            "Lift shared outbound"
+        };
         if ui
-            .button("Apply to fleet")
+            .button(lift_label)
             .comms_hover_text("Publish action/voice/shared-config")
             .clicked()
         {
@@ -2881,6 +2981,26 @@ fn voice_shared_outbound(
             );
         }
     });
+}
+
+/// Select a projected, provisioned fleet-board node without typing a dest.
+/// Unprovisioned / awaiting-master-key rows stay off the picker.
+fn voice_provisioned_node_chips(
+    ui: &mut egui::Ui,
+    selected: &mut String,
+    nodes: &[VoiceNodeProjection],
+) {
+    let identity = selected.trim().to_owned();
+    for node in nodes.iter().filter(|node| node.is_provisioned()) {
+        let active = identity == node.node_id || identity == node.hostname;
+        if ui
+            .selectable_label(active, &node.hostname)
+            .comms_hover_text(format!("Use projected node {}", node.node_id))
+            .clicked()
+        {
+            selected.clone_from(&node.node_id);
+        }
+    }
 }
 
 fn voice_cutover(
@@ -3126,19 +3246,20 @@ mod tests {
     use mde_collab_types::{ActorClock, ActorId, AlertPayload, AlertView, EventId};
 
     use super::{
-        apply_gateway_form, apply_voice_admin, coalesced_activity_rows,
-        has_provisioned_voice_account, hydrate_gateway_readout, resolve_voice_node,
-        seed_voice_shared_form_state, validate_cutover, validate_did_route, validate_failover,
-        validate_gateway_clear, validate_gateway_set, validate_shared_config,
-        voice_projection_empty_notes, voice_unprovisioned_detail, voice_unprovisioned_headline,
-        workgroup_gateway_toml_path, ActivityAdminSnapshot, ActivityEntry, ActivityFilter,
-        AlertInbox, GatewayCommand, GatewayFormIntent, GatewayFormOutcome, GatewayFormState,
-        GatewayReadout, GatewayRefuse, GatewaySink, Severity, SpaceId, VoiceAdminCommand,
-        VoiceAdminFormIntent, VoiceAdminFormOutcome, VoiceAdminFormState, VoiceAdminRefuse,
-        VoiceAdminSink, VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy,
-        VoiceNodeProjection, VoiceRegState, VoiceSharedOutbound, VOICE_DID_ROUTE_TOPIC,
-        VOICE_FAILOVER_TOPIC, VOICE_PROVISION_TOPIC, VOICE_SHARED_CONFIG_TOPIC,
-        VOIP_CLEAR_GATEWAY_TOPIC, VOIP_GET_GATEWAY_TOPIC, VOIP_SET_GATEWAY_TOPIC,
+        apply_gateway_form, apply_voice_admin, apply_voice_did_inventory_row,
+        apply_voice_node_failover, coalesced_activity_rows, has_provisioned_voice_account,
+        hydrate_gateway_readout, resolve_voice_node, seed_voice_shared_form_state,
+        validate_cutover, validate_did_route, validate_failover, validate_gateway_clear,
+        validate_gateway_set, validate_shared_config, voice_projection_empty_notes,
+        voice_unprovisioned_detail, voice_unprovisioned_headline, workgroup_gateway_toml_path,
+        ActivityAdminSnapshot, ActivityEntry, ActivityFilter, AlertInbox, GatewayCommand,
+        GatewayFormIntent, GatewayFormOutcome, GatewayFormState, GatewayReadout, GatewayRefuse,
+        GatewaySink, Severity, SpaceId, VoiceAdminCommand, VoiceAdminFormIntent,
+        VoiceAdminFormOutcome, VoiceAdminFormState, VoiceAdminRefuse, VoiceAdminSink,
+        VoiceCutoverPhase, VoiceCutoverStatus, VoiceDid, VoiceFailoverPolicy, VoiceNodeProjection,
+        VoiceRegState, VoiceSharedOutbound, VOICE_DID_ROUTE_TOPIC, VOICE_FAILOVER_TOPIC,
+        VOICE_PROVISION_TOPIC, VOICE_SHARED_CONFIG_TOPIC, VOIP_CLEAR_GATEWAY_TOPIC,
+        VOIP_GET_GATEWAY_TOPIC, VOIP_SET_GATEWAY_TOPIC,
     };
 
     fn entry(
@@ -3796,6 +3917,14 @@ mod tests {
             GatewayRefuse::MalformedHost
         );
         assert_eq!(
+            validate_gateway_set("pbx.example.com:5062", None, "alice", "", "", None).unwrap_err(),
+            GatewayRefuse::MalformedHost
+        );
+        assert_eq!(
+            validate_gateway_set("alice@pbx.example.com", None, "alice", "", "", None).unwrap_err(),
+            GatewayRefuse::MalformedHost
+        );
+        assert_eq!(
             validate_gateway_set("pbx.example.com", Some(0), "alice", "", "", None).unwrap_err(),
             GatewayRefuse::InvalidPort
         );
@@ -4271,6 +4400,154 @@ mod tests {
             live_cmds[3],
             VoiceAdminCommand::SharedConfig { .. }
         ));
+
+        assert_eq!(
+            apply_voice_admin(
+                &mut form,
+                &nodes,
+                &dids,
+                Some(&cutover),
+                &mut live,
+                VoiceAdminFormIntent::Cutover,
+            ),
+            VoiceAdminFormOutcome::ArmedCutover
+        );
+        match apply_voice_admin(
+            &mut form,
+            &nodes,
+            &dids,
+            Some(&cutover),
+            &mut live,
+            VoiceAdminFormIntent::Cutover,
+        ) {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(command.topic(), VOICE_PROVISION_TOPIC);
+                assert_eq!(command.json_body(), "{}");
+                assert!(matches!(command, VoiceAdminCommand::Cutover));
+            }
+            other => panic!("expected published cutover, got {other:?}"),
+        }
+        let with_cutover = live.drain();
+        assert_eq!(with_cutover.len(), 1);
+        assert!(matches!(with_cutover[0], VoiceAdminCommand::Cutover));
+    }
+
+    #[test]
+    fn did_table_and_per_node_failover_publish_projected_rows_without_inventing_dests() {
+        let eagle = provisioned_node("peer:eagle", "eagle", "eagle");
+        let otter = provisioned_node("peer:otter", "otter", "otter");
+        let nodes = vec![eagle, otter];
+        let dids = vec![
+            inventory("15551234567", Some("eagle")),
+            inventory("15557654321", None),
+        ];
+
+        let mut form = VoiceAdminFormState::draft(
+            "00000000",
+            "peer:ghost",
+            "peer:ghost",
+            0,
+            "15550001111",
+            "15551234567",
+            "main",
+        );
+        let mut sink = VoiceAdminSink::new();
+
+        match apply_voice_did_inventory_row(&mut form, &dids[0], true, &nodes, &dids, &mut sink) {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(
+                    command,
+                    VoiceAdminCommand::DidRoute {
+                        did: "15551234567".to_owned(),
+                        node_id: None,
+                    }
+                );
+                assert_eq!(command.topic(), VOICE_DID_ROUTE_TOPIC);
+            }
+            other => panic!("routed inventory row must unroute, got {other:?}"),
+        }
+        assert_eq!(form.did, "15551234567");
+
+        form.route_node = "eagle".to_owned();
+        match apply_voice_did_inventory_row(&mut form, &dids[1], false, &nodes, &dids, &mut sink) {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(
+                    command,
+                    VoiceAdminCommand::DidRoute {
+                        did: "15557654321".to_owned(),
+                        node_id: Some("peer:eagle".to_owned()),
+                    }
+                );
+            }
+            other => panic!("unrouted inventory row must route to the picked node, got {other:?}"),
+        }
+
+        match apply_voice_node_failover(&mut form, "peer:otter", 2, &nodes, &mut sink) {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(
+                    command,
+                    VoiceAdminCommand::Failover {
+                        node_id: "peer:otter".to_owned(),
+                        policy: VoiceFailoverPolicy::None,
+                    }
+                );
+                assert_eq!(command.topic(), VOICE_FAILOVER_TOPIC);
+            }
+            other => panic!("per-node failover must publish for otter, got {other:?}"),
+        }
+        assert_eq!(form.failover_node, "peer:otter");
+        assert_eq!(form.failover_kind, 2);
+
+        form.failover_number = "15557654321".to_owned();
+        match apply_voice_node_failover(&mut form, "eagle", 1, &nodes, &mut sink) {
+            VoiceAdminFormOutcome::Published(command) => {
+                assert_eq!(
+                    command,
+                    VoiceAdminCommand::Failover {
+                        node_id: "peer:eagle".to_owned(),
+                        policy: VoiceFailoverPolicy::Forward {
+                            number: "15557654321".to_owned(),
+                        },
+                    }
+                );
+            }
+            other => panic!("hostname chip must resolve to peer:eagle, got {other:?}"),
+        }
+
+        let awaiting = VoiceNodeProjection {
+            node_id: "peer:fox".to_owned(),
+            hostname: "fox".to_owned(),
+            username: "fox".to_owned(),
+            sip_uri: "fox@sip.vitelity.net".to_owned(),
+            reg_state: VoiceRegState::Provisioning,
+            routed_dids: Vec::new(),
+            failover: None,
+            updated_at_s: 1,
+        };
+        assert_eq!(
+            apply_voice_node_failover(&mut form, "peer:fox", 0, &[awaiting], &mut sink),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::NoProvisionedAccount)
+        );
+        assert_eq!(
+            apply_voice_did_inventory_row(&mut form, &dids[0], true, &[], &dids, &mut sink),
+            VoiceAdminFormOutcome::Refused(VoiceAdminRefuse::NoProvisionedAccount)
+        );
+
+        let published = sink.drain();
+        assert_eq!(published.len(), 4);
+        assert!(matches!(
+            published[0],
+            VoiceAdminCommand::DidRoute { node_id: None, .. }
+        ));
+        assert!(matches!(
+            published[1],
+            VoiceAdminCommand::DidRoute {
+                node_id: Some(_),
+                ..
+            }
+        ));
+        assert!(matches!(published[2], VoiceAdminCommand::Failover { .. }));
+        assert!(matches!(published[3], VoiceAdminCommand::Failover { .. }));
     }
 
     #[test]

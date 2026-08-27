@@ -33,7 +33,7 @@ use mde_collab_types::{
 
 use crate::files::{fmt_bytes, transfer_state_color, transfer_state_label};
 use crate::icons::CommsHoverExt;
-use crate::{icons, relative_age, CommunicationsSurface};
+use crate::{icons, CommunicationsSurface};
 
 const INTENT_NONE: u8 = 0;
 const INTENT_OPEN: u8 = 1;
@@ -418,6 +418,18 @@ impl CommunicationsSurface {
                     .color(theme_color(ui, Style::TEXT_STRONG)),
             );
             ui.add_space(Style::SP_XS);
+            // Consume before the text fields so Enter/Escape cannot be eaten by
+            // a focused draft. Same Save/Remove path as the buttons.
+            if ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Escape))
+            {
+                self.transfers_ui.close();
+                return;
+            }
+            let submit = ui
+                .ctx()
+                .input_mut(|i| i.consume_key(egui::Modifiers::NONE, egui::Key::Enter));
             if self.transfers_ui.edit_id.is_some() {
                 // Replace-by-ID, matching `mackesd transfer sync-pair add --id`.
                 // A mutable id here would mint a second row and orphan the original.
@@ -437,11 +449,16 @@ impl CommunicationsSurface {
                 labeled_edit(ui, "Id", &mut self.transfers_ui.draft_id);
             }
             labeled_edit(ui, "Interval", &mut self.transfers_ui.draft_interval);
+            ui.label(
+                egui::RichText::new("positive duration such as 30s, 5m, 1h, or seconds")
+                    .small()
+                    .color(theme_color(ui, Style::TEXT_DIM)),
+            );
             labeled_edit(ui, "Source", &mut self.transfers_ui.draft_source);
             labeled_edit(ui, "Destination", &mut self.transfers_ui.draft_dest);
             labeled_edit(ui, "Bwlimit", &mut self.transfers_ui.draft_bwlimit);
             ui.horizontal(|ui| {
-                if ui.button("Save").clicked() {
+                if submit || ui.button("Save").clicked() {
                     self.save_sync_pair_draft();
                 }
                 if ui.button("Cancel").clicked() {
@@ -565,25 +582,22 @@ impl CommunicationsSurface {
     }
 
     fn save_sync_pair_draft(&mut self) {
-        let source = self.transfers_ui.draft_source.trim();
-        let dest = self.transfers_ui.draft_dest.trim();
-        // Edit is replace-by-ID — the same as `mackesd transfer sync-pair add
-        // --id`. A changed draft id must not mint a second store row.
-        let id = if let Some(edit_id) = self.transfers_ui.edit_id.clone() {
-            edit_id
-        } else {
-            let id = self.transfers_ui.draft_id.trim();
-            if id.is_empty() {
-                slug_pair_id(source, dest)
-            } else {
-                id.to_owned()
-            }
-        };
-        if !valid_pair_id(&id) {
-            self.transfers_ui
-                .set_refuse(format!("invalid sync pair id `{id}`"));
+        // Same order as `mackesd transfer sync-pair add`: trim, parse interval,
+        // validate source/destination/NUL/bwlimit/id, then slug. Identical
+        // requests must refuse with the same copy and must not mint a second
+        // store row on edit (replace-by-ID, matching `add --id`).
+        let source = self.transfers_ui.draft_source.trim().to_owned();
+        let dest = self.transfers_ui.draft_dest.trim().to_owned();
+        let bwlimit_raw = self.transfers_ui.draft_bwlimit.trim().to_owned();
+        let interval_raw = self.transfers_ui.draft_interval.trim().to_owned();
+        let Some(every_secs) = parse_interval_secs(&interval_raw) else {
+            // Same refusal text as `mackesd transfer sync-pair add` so the
+            // editor cannot look queued while the CLI would have failed fast.
+            self.transfers_ui.set_refuse(format!(
+                "malformed interval `{interval_raw}` (expected a positive duration such as 30s, 5m, 1h, or seconds)"
+            ));
             return;
-        }
+        };
         if source.is_empty() || dest.is_empty() {
             self.transfers_ui
                 .set_refuse("sync pair requires non-empty source and destination");
@@ -594,34 +608,37 @@ impl CommunicationsSurface {
                 .set_refuse("sync pair source and destination must not contain NUL bytes");
             return;
         }
-        let interval_raw = self.transfers_ui.draft_interval.trim();
-        let Some(every_secs) = parse_interval_secs(interval_raw) else {
-            // Same refusal text as `mackesd transfer sync-pair add` so the
-            // editor cannot look queued while the CLI would have failed fast.
-            self.transfers_ui.set_refuse(format!(
-                "malformed interval `{interval_raw}` (expected a positive duration such as 30s, 5m, 1h, or seconds)"
-            ));
+        let bwlimit = if bwlimit_raw.is_empty() {
+            None
+        } else if !valid_sync_pair_bwlimit(&bwlimit_raw) {
+            self.transfers_ui
+                .set_refuse(format!("invalid sync pair bwlimit `{bwlimit_raw}`"));
             return;
+        } else {
+            Some(bwlimit_raw)
         };
-        let bwlimit = {
-            let raw = self.transfers_ui.draft_bwlimit.trim();
-            if raw.is_empty() {
-                None
-            } else if !valid_sync_pair_bwlimit(raw) {
-                self.transfers_ui
-                    .set_refuse(format!("invalid sync pair bwlimit `{raw}`"));
-                return;
+        let id = if let Some(edit_id) = self.transfers_ui.edit_id.clone() {
+            edit_id
+        } else {
+            let id = self.transfers_ui.draft_id.trim();
+            if id.is_empty() {
+                slug_pair_id(&source, &dest)
             } else {
-                Some(raw.to_owned())
+                id.to_owned()
             }
         };
+        if !valid_pair_id(&id) {
+            self.transfers_ui
+                .set_refuse(format!("invalid sync pair id `{id}`"));
+            return;
+        }
         let queued = format!(
             "transfer sync-pair add: queued {id} every {every_secs}s (the daemon saves it on its next tick)"
         );
         self.sync_pair_sink.emit(SyncPairCommand::Save {
             id,
-            source: source.to_owned(),
-            dest: dest.to_owned(),
+            source,
+            dest,
             every_secs,
             bwlimit,
         });
@@ -692,6 +709,41 @@ impl CommunicationsSurface {
     #[cfg(test)]
     pub(crate) fn begin_edit_sync_pair_for_test(&mut self, pair: &SyncPairView) {
         self.transfers_ui.begin_edit(pair);
+    }
+
+    /// Fill editor drafts without publishing. Preserves [`TransfersUi::edit_id`]
+    /// so create vs replace-by-ID stays under the caller's control.
+    #[cfg(test)]
+    pub(crate) fn fill_sync_pair_draft_for_test(
+        &mut self,
+        id: &str,
+        interval: &str,
+        source: &str,
+        dest: &str,
+        bwlimit: Option<&str>,
+    ) {
+        self.transfers_ui.editor_open = true;
+        self.transfers_ui.draft_id = id.to_owned();
+        self.transfers_ui.draft_interval = interval.to_owned();
+        self.transfers_ui.draft_source = source.to_owned();
+        self.transfers_ui.draft_dest = dest.to_owned();
+        self.transfers_ui.draft_bwlimit = bwlimit.unwrap_or("").to_owned();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn save_open_sync_pair_draft_for_test(&mut self) {
+        self.save_sync_pair_draft();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn sync_pair_drafts_for_test(&self) -> (String, String, String, String, String) {
+        (
+            self.transfers_ui.draft_id.clone(),
+            self.transfers_ui.draft_interval.clone(),
+            self.transfers_ui.draft_source.clone(),
+            self.transfers_ui.draft_dest.clone(),
+            self.transfers_ui.draft_bwlimit.clone(),
+        )
     }
 
     fn jobs_section(
@@ -940,12 +992,34 @@ fn format_interval_draft(every_secs: u64) -> String {
     }
 }
 
+/// Future duration using the same buckets as Communications `relative_age` and
+/// the CLI `sync-pair list` next-run column. Kept local so next-run copy cannot
+/// drift if `relative_age`'s argument order is used as an "until" trick.
+fn relative_until(now_ms: i64, then_ms: i64) -> String {
+    let secs = then_ms.saturating_sub(now_ms).max(0) / 1_000;
+    if secs < 45 {
+        return "now".to_owned();
+    }
+    let mins = secs / 60;
+    if mins < 1 {
+        return "1m".to_owned();
+    }
+    if mins < 60 {
+        return format!("{mins}m");
+    }
+    let hours = mins / 60;
+    if hours < 24 {
+        return format!("{hours}h");
+    }
+    format!("{}d", hours / 24)
+}
+
 fn format_next_run(now_unix_ms: i64, next_run_unix_ms: Option<i64>) -> String {
     match next_run_unix_ms {
         None => "next-run pending".to_owned(),
         Some(ts) if ts <= now_unix_ms => "due now".to_owned(),
         Some(ts) => {
-            let until = relative_age(ts, now_unix_ms);
+            let until = relative_until(now_unix_ms, ts);
             if until == "now" {
                 "due soon".to_owned()
             } else {
@@ -1023,6 +1097,7 @@ mod tests {
         slug_pair_id, SyncPairCommand, SyncPairView,
     };
     use crate::CommunicationsSurface;
+    use mde_egui::egui;
 
     fn projected_pair(id: &str) -> SyncPairView {
         SyncPairView {
@@ -1039,14 +1114,22 @@ mod tests {
 
     #[test]
     fn parse_interval_secs_refuses_malformed_zero_and_unknown_units() {
-        assert_eq!(parse_interval_secs("nope"), None);
-        assert_eq!(parse_interval_secs(""), None);
-        assert_eq!(parse_interval_secs("0"), None);
-        assert_eq!(parse_interval_secs("0s"), None);
-        assert_eq!(parse_interval_secs("-5m"), None);
-        assert_eq!(parse_interval_secs("15x"), None);
+        for raw in [
+            "", "abc", "nope", "0", "0s", "-5m", "10y", "1.5h", "h", "15x",
+        ] {
+            assert_eq!(
+                parse_interval_secs(raw),
+                None,
+                "interval `{raw}` must refuse like the CLI"
+            );
+        }
+        assert_eq!(parse_interval_secs("30s"), Some(30));
+        assert_eq!(parse_interval_secs("5m"), Some(300));
         assert_eq!(parse_interval_secs("15m"), Some(900));
         assert_eq!(parse_interval_secs("1h"), Some(3600));
+        assert_eq!(parse_interval_secs("2d"), Some(172_800));
+        assert_eq!(parse_interval_secs("90"), Some(90));
+        assert_eq!(parse_interval_secs(" 15m "), Some(900));
     }
 
     #[test]
@@ -1179,6 +1262,15 @@ mod tests {
             "empty source must refuse with the CLI text"
         );
 
+        surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "", None);
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("non-empty source and destination")),
+            "empty destination must refuse with the CLI text"
+        );
+
         surface.save_sync_pair_draft_for_test("docs", "15m", "/src\0", "/dst", None);
         assert!(surface.drain_sync_pair_commands().is_empty());
         assert!(
@@ -1186,6 +1278,39 @@ mod tests {
                 .sync_pair_notice_for_test()
                 .is_some_and(|n| n.contains("NUL bytes")),
             "NUL source must refuse with the CLI text"
+        );
+
+        surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "/dst\0", None);
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("NUL bytes")),
+            "NUL destination must refuse with the CLI text"
+        );
+
+        for bad_id in [".", ".."] {
+            surface.save_sync_pair_draft_for_test(bad_id, "15m", "/src", "/dst", None);
+            assert!(
+                surface.drain_sync_pair_commands().is_empty(),
+                "id `{bad_id}` must not publish"
+            );
+            assert!(
+                surface
+                    .sync_pair_notice_for_test()
+                    .is_some_and(|n| { n.contains("invalid sync pair id") && n.contains(bad_id) }),
+                "id `{bad_id}` must refuse with the CLI text"
+            );
+        }
+
+        // CLI parses interval before id: combined hostility must name the interval.
+        surface.save_sync_pair_draft_for_test("../escape", "nope", "/src", "/dst", None);
+        assert!(surface.drain_sync_pair_commands().is_empty());
+        assert!(
+            surface
+                .sync_pair_notice_for_test()
+                .is_some_and(|n| n.contains("malformed interval") && n.contains("nope")),
+            "malformed interval must win over invalid id, matching CLI add order"
         );
 
         surface.save_sync_pair_draft_for_test("docs", "15m", "/src", "/dst", Some("1m;rm"));
@@ -1237,10 +1362,200 @@ mod tests {
             format_next_run(1_000_000, Some(1_000_000 + 60_000)),
             "next in 1m"
         );
+        assert_eq!(
+            format_next_run(1_000_000, Some(1_000_000 + 10_000)),
+            "due soon"
+        );
         assert_eq!(format_last_result(None), "never run");
         assert_eq!(format_last_result(Some("")), "never run");
         assert_eq!(format_last_result(Some("done")), "last: done");
         assert_eq!(format_interval_draft(900), "15m");
         assert_eq!(slug_pair_id("/src", "/dst"), "src--dst");
+    }
+
+    #[test]
+    fn editor_edit_round_trips_interval_source_dest_bwlimit_replace_by_id() {
+        let mut surface = CommunicationsSurface::new();
+        let pair = projected_pair("docs");
+        surface.set_sync_pair_views(vec![pair.clone()]);
+        surface.begin_edit_sync_pair_for_test(&pair);
+        assert_eq!(
+            surface.sync_pair_drafts_for_test(),
+            (
+                "docs".into(),
+                "15m".into(),
+                "/src".into(),
+                "/dst".into(),
+                "2m".into()
+            )
+        );
+
+        surface.save_open_sync_pair_draft_for_test();
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Save {
+                id: "docs".into(),
+                source: "/src".into(),
+                dest: "/dst".into(),
+                every_secs: 900,
+                bwlimit: Some("2m".into()),
+            }]
+        );
+
+        surface.begin_edit_sync_pair_for_test(&pair);
+        surface.fill_sync_pair_draft_for_test("renamed", "1h", "/a", "/b", Some("1m"));
+        surface.save_open_sync_pair_draft_for_test();
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Save {
+                id: "docs".into(),
+                source: "/a".into(),
+                dest: "/b".into(),
+                every_secs: 3600,
+                bwlimit: Some("1m".into()),
+            }],
+            "edit must replace-by-ID and publish the edited interval/source/dest/bwlimit"
+        );
+    }
+
+    #[test]
+    fn remove_trims_id_like_the_editor_fields() {
+        let mut surface = CommunicationsSurface::new();
+        surface.set_sync_pair_views(vec![projected_pair("docs")]);
+        surface.remove_sync_pair_for_test("  docs  ");
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Remove { id: "docs".into() }]
+        );
+    }
+
+    fn key(k: egui::Key) -> egui::Event {
+        egui::Event::Key {
+            key: k,
+            physical_key: None,
+            pressed: true,
+            repeat: false,
+            modifiers: egui::Modifiers::NONE,
+        }
+    }
+
+    fn painted_labels(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    fn render_transfers_editor(
+        surface: &mut CommunicationsSurface,
+        events: Vec<egui::Event>,
+    ) -> Vec<String> {
+        use crate::fixture::FixtureData;
+        use crate::CommandSink;
+        use mde_egui::Style;
+
+        let data = FixtureData::new("eagle", 1_000_000);
+        let ctx = egui::Context::default();
+        Style::install(&ctx);
+        let mut sink = CommandSink::new();
+        let out = ctx.run(
+            egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(
+                    egui::Pos2::ZERO,
+                    egui::vec2(1000.0, 700.0),
+                )),
+                events,
+                time: Some(0.0),
+                ..Default::default()
+            },
+            |ctx| {
+                egui::CentralPanel::default().show(ctx, |ui| {
+                    surface.transfers_body(ui, &data, &mut sink);
+                });
+            },
+        );
+        painted_labels(&out.shapes)
+    }
+
+    #[test]
+    fn editor_paints_create_and_edit_fields_and_honours_enter_escape() {
+        let mut surface = CommunicationsSurface::new();
+        surface.begin_new_transfer();
+        surface.fill_sync_pair_draft_for_test("docs", "15m", "/src", "/dst", Some("2m"));
+        let texts = render_transfers_editor(&mut surface, Vec::new());
+        for label in [
+            "New transfer",
+            "Interval",
+            "Source",
+            "Destination",
+            "Bwlimit",
+            "30s, 5m, 1h",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.contains(label)),
+                "create editor must paint `{label}`: {texts:?}"
+            );
+        }
+
+        let _ = render_transfers_editor(&mut surface, vec![key(egui::Key::Enter)]);
+        assert_eq!(
+            surface.drain_sync_pair_commands(),
+            vec![SyncPairCommand::Save {
+                id: "docs".into(),
+                source: "/src".into(),
+                dest: "/dst".into(),
+                every_secs: 900,
+                bwlimit: Some("2m".into()),
+            }],
+            "Enter must publish Save through TransferVerb, not a second store"
+        );
+        assert!(
+            !surface.editor_open_for_test(),
+            "Enter save must close the editor"
+        );
+
+        let pair = projected_pair("docs");
+        surface.set_sync_pair_views(vec![pair.clone()]);
+        surface.begin_edit_sync_pair_for_test(&pair);
+        let texts = render_transfers_editor(&mut surface, Vec::new());
+        for label in [
+            "Edit sync pair",
+            "Interval",
+            "Source",
+            "Destination",
+            "Bwlimit",
+        ] {
+            assert!(
+                texts.iter().any(|t| t.contains(label)),
+                "edit editor must paint `{label}`: {texts:?}"
+            );
+        }
+        assert!(
+            texts.iter().any(|t| t == "docs"),
+            "edit must show the locked id: {texts:?}"
+        );
+
+        surface.begin_new_transfer();
+        let _ = render_transfers_editor(&mut surface, vec![key(egui::Key::Escape)]);
+        assert!(
+            !surface.editor_open_for_test(),
+            "Escape must cancel without publishing"
+        );
+        assert!(
+            surface.drain_sync_pair_commands().is_empty(),
+            "Escape must not publish a verb"
+        );
     }
 }

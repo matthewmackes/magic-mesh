@@ -36,11 +36,15 @@
 //! signaling emit, a view-only intent bit, or an invented connected/PSTN state.
 //!
 //! Camera and screen follow the same projection: an offered live track renders
-//! as attached, and every other case is unavailable. Device selectors stay
-//! disabled because [`MediaSessionV1`] does not carry device names. Group SFU
-//! (S3) and SIP gateway PSTN (S4) remain worker-owned. There is deliberately
-//! **no recording and no transcription** anywhere — not in this UI, not in the
-//! commands, not in the worker or its state.
+//! as attached, and every other case is unavailable. Device selectors enumerate
+//! [`MediaDeviceV1`] rows published on that session and stay disabled — there is
+//! no renderer-owned device pick; the worker binds the selected row. Empty
+//! inventory is the honest "not yet published" state. Group SFU (S3) and SIP
+//! gateway PSTN (S4) remain worker-owned. Mid-call drop walks the typed
+//! reconnecting/failed ladder; a [`MediaRecoveryV1`] re-dial flag emits
+//! [`StartCall`](CollabCommand::StartCall) for the same space and kind. There is
+//! deliberately **no recording and no transcription** anywhere — not in this UI,
+//! not in the commands, not in the worker or its state.
 //!
 //! # Q15 VoiceAccounts / `lift_if_legacy` (WL-FUNC-024 S4)
 //!
@@ -63,8 +67,8 @@ use crate::frame::call_kind_label;
 use crate::icons::CommsHoverExt;
 use crate::{icons, relative_age, ActivityAdminSnapshot, CommandSink, CommunicationsSurface};
 
-/// The honest label while [`MediaSessionV1`] carries tracks but not device
-/// names. Selectors stay disabled rather than inventing a hardware list.
+/// Fallback label while a published session has not enumerated a device for
+/// that track. Selectors stay disabled rather than inventing hardware.
 const DEFAULT_DEVICE: &str = "System default";
 
 /// Keep data-backed labels readable inside the fixed Calls cards and rows. The
@@ -257,9 +261,9 @@ impl CommunicationsSurface {
         });
         ui.separator();
 
-        // The media device row (mic / camera / screen). Device names are not
-        // on MediaSessionV1, so the selectors stay disabled; a published
-        // session can still refine the unavailable reason.
+        // The media device row (mic / camera / screen). Published
+        // MediaDeviceV1 rows are enumerated; selectors stay disabled because
+        // the worker owns the bind. Empty inventory is not invented hardware.
         self.call_device_row(ui);
         self.pstn_provider_row(ui);
         ui.separator();
@@ -394,9 +398,9 @@ impl CommunicationsSurface {
         }
     }
 
-    /// The media device row: visible mic / camera / screen selectors, disabled
-    /// because [`MediaSessionV1`] does not publish device names. A present
-    /// session can name a typed device-absent or permission-denied reason.
+    /// The media device row: visible mic / camera / screen selectors that
+    /// enumerate published [`MediaDeviceV1`] labels. Selectors stay disabled —
+    /// picking a device is worker-owned; an empty inventory is unavailable.
     pub(crate) fn call_device_row(&mut self, ui: &mut egui::Ui) {
         let session = self.call_media.sessions.first();
         let row_reason = device_row_reason(session);
@@ -416,18 +420,21 @@ impl CommunicationsSurface {
                 CallDevice::Microphone,
                 &mut self.call_media.mic,
                 mic_reason,
+                published_device_labels(session, MediaTrackKind::Audio),
             );
             device_combo(
                 ui,
                 CallDevice::Camera,
                 &mut self.call_media.camera,
                 camera_reason,
+                published_device_labels(session, MediaTrackKind::Video),
             );
             device_combo(
                 ui,
                 CallDevice::Screen,
                 &mut self.call_media.screen,
                 screen_reason,
+                published_device_labels(session, MediaTrackKind::Screen),
             );
         });
         ui.label(
@@ -487,6 +494,8 @@ impl CommunicationsSurface {
             .iter()
             .filter(|p| p.state == CallParticipantState::Connected)
             .count();
+        let session = self.call_media.session_for(call.call).cloned();
+        let can_redial = call_start_enabled(directory, call.space);
 
         mde_egui::card().show(ui, |ui| {
             call_card_header(
@@ -495,7 +504,7 @@ impl CommunicationsSurface {
                 now_unix_ms,
                 call,
                 connected,
-                self.call_media.session_for(call.call),
+                session.as_ref(),
             );
             for p in &call.participants {
                 call_roster_row(ui, me, p);
@@ -505,7 +514,6 @@ impl CommunicationsSurface {
                     self.ringing_controls(ui, sink, call.call);
                 }
                 Some(CallParticipantState::Connected) => {
-                    let session = self.call_media.session_for(call.call).cloned();
                     let muted = session
                         .as_ref()
                         .map(|plane| plane.local_muted)
@@ -514,11 +522,14 @@ impl CommunicationsSurface {
                     if self.dtmf_pad == Some(call.call) {
                         self.dtmf_keypad(ui, sink, call.call, session.as_ref());
                     }
+                    self.redial_controls(ui, sink, call, session.as_ref(), can_redial);
                 }
-                // Declined/Left this call, or only watching it (not a
-                // participant): the roster is shown read-only — no faked
-                // "rejoin" control, because there is no such command today.
-                _ => {}
+                // Declined/Left this call, or only watching it: no faked rejoin
+                // of a live dialog. A published MediaRecoveryV1 redial flag is
+                // the manual re-dial affordance (StartCall, same space/kind).
+                _ => {
+                    self.redial_controls(ui, sink, call, session.as_ref(), can_redial);
+                }
             }
         });
     }
@@ -627,6 +638,33 @@ impl CommunicationsSurface {
             .clicked()
             {
                 self.hang_up_call(sink, call);
+            }
+        });
+    }
+
+    /// Manual re-dial after auto-reconnect is exhausted. Emits StartCall for
+    /// the same space/kind; disabled when the space has no peer or the session
+    /// does not offer redial.
+    fn redial_controls(
+        &self,
+        ui: &mut egui::Ui,
+        sink: &mut CommandSink,
+        call: &CallView,
+        session: Option<&MediaSessionV1>,
+        can_start: bool,
+    ) {
+        if !session.is_some_and(MediaSessionV1::offers_redial) {
+            return;
+        }
+        let hint = if can_start {
+            "Redial this call"
+        } else {
+            "Redial — unavailable: this space has no other current members"
+        };
+        ui.add_enabled_ui(can_start, |ui| {
+            if icons::icon_button(ui, icons::CALL_START, Style::SP_M, Style::ACCENT, hint).clicked()
+            {
+                self.redial_call(sink, call, session, can_start);
             }
         });
     }
@@ -741,11 +779,37 @@ impl CommunicationsSurface {
         }
     }
 
+    /// Emit [`StartCall`](CollabCommand::StartCall) for the same space and kind
+    /// only when a published [`MediaRecoveryV1`] offers manual re-dial. No
+    /// session, or a reconnecting session, is fail-closed — never a faked
+    /// rejoin of a live dialog.
+    pub(crate) fn redial_call(
+        &self,
+        sink: &mut CommandSink,
+        call: &CallView,
+        session: Option<&MediaSessionV1>,
+        can_start: bool,
+    ) {
+        if can_start && session.is_some_and(MediaSessionV1::offers_redial) {
+            self.start_call(sink, call.space, call.kind);
+        }
+    }
+
     /// Publish retained [`MediaSessionV1`] documents into this seat's Calls view.
     /// Empty input is the honest no-projection state — never a faked connected call.
     #[cfg_attr(not(test), allow(dead_code))]
     pub(crate) fn apply_media_sessions(&mut self, sessions: Vec<MediaSessionV1>) {
         self.call_media.sessions = sessions;
+        self.reconcile_device_labels();
+    }
+
+    /// Mirror selected [`MediaDeviceV1`] labels into the device row. Missing
+    /// inventory falls back to the system-default placeholder — never a path.
+    fn reconcile_device_labels(&mut self) {
+        let session = self.call_media.sessions.first();
+        self.call_media.mic = selected_device_label(session, MediaTrackKind::Audio);
+        self.call_media.camera = selected_device_label(session, MediaTrackKind::Video);
+        self.call_media.screen = selected_device_label(session, MediaTrackKind::Screen);
     }
 
     /// Bind published [`SipLegV1`] documents from the Q15 VoiceAccounts path.
@@ -815,6 +879,7 @@ impl CommunicationsSurface {
         };
         self.call_media.camera_on = camera_on;
         self.call_media.screen_sharing = screen_sharing;
+        self.reconcile_device_labels();
     }
 
     /// Open the in-call DTMF keypad for `call` (test seam for the keypad gate).
@@ -888,18 +953,34 @@ impl CallDevice {
         }
     }
 
+    const fn track_kind(self) -> MediaTrackKind {
+        match self {
+            Self::Microphone => MediaTrackKind::Audio,
+            Self::Camera => MediaTrackKind::Video,
+            Self::Screen => MediaTrackKind::Screen,
+        }
+    }
+
     fn unavailable_reason_on_plane(self, session: Option<&MediaSessionV1>) -> &'static str {
         let Some(session) = session else {
             return self.unavailable_reason();
         };
+        if let Some(label) = session_ladder_unavailable_label(session) {
+            return label;
+        }
         match &session.state {
-            MediaSessionStateV1::Failed { reason } => media_failure_unavailable_label(*reason),
-            MediaSessionStateV1::Reconnecting { .. } => media_reconnecting_unavailable_label(),
             MediaSessionStateV1::DeviceAbsent { track } => device_absent_unavailable_label(*track),
             MediaSessionStateV1::PermissionDenied { track } => {
                 permission_denied_unavailable_label(*track)
             }
             MediaSessionStateV1::Negotiating | MediaSessionStateV1::Connected => {
+                if session.devices_for(self.track_kind()).is_empty() {
+                    self.unavailable_reason()
+                } else {
+                    "Seat capture devices published by the live media session; selection is worker-owned"
+                }
+            }
+            MediaSessionStateV1::Failed { .. } | MediaSessionStateV1::Reconnecting { .. } => {
                 self.unavailable_reason()
             }
         }
@@ -907,10 +988,15 @@ impl CallDevice {
 }
 
 /// A labeled media device combo — the glyph, then a disabled egui combo showing
-/// the honest system default. [`MediaSessionV1`] does not carry device names, so
-/// this stays visible but non-actionable, with a device-specific disabled reason
-/// for hover and assistive technology.
-fn device_combo(ui: &mut egui::Ui, device: CallDevice, value: &mut String, reason: &str) {
+/// either the selected published [`MediaDeviceV1`] label or the system default.
+/// Selection stays non-actionable: there is no renderer-owned device command.
+fn device_combo(
+    ui: &mut egui::Ui,
+    device: CallDevice,
+    value: &mut String,
+    reason: &str,
+    published: Vec<String>,
+) {
     icons::icon(ui, device.glyph(), Style::SP_M, Style::TEXT_DIM).comms_hover_text(device.label());
     let accessible_label = device.accessible_label_for(reason);
     let response = ui
@@ -918,7 +1004,13 @@ fn device_combo(ui: &mut egui::Ui, device: CallDevice, value: &mut String, reaso
             egui::ComboBox::new(("mde-collab-call-device", device.label()), device.label())
                 .selected_text(bounded_display_text(value, MAX_CALL_LABEL_CHARS))
                 .show_ui(ui, |ui| {
-                    ui.label(DEFAULT_DEVICE);
+                    if published.is_empty() {
+                        ui.label(DEFAULT_DEVICE);
+                    } else {
+                        for label in &published {
+                            ui.label(bounded_display_text(label, MAX_CALL_LABEL_CHARS));
+                        }
+                    }
                 })
         })
         .inner
@@ -1074,30 +1166,37 @@ fn live_audio_unavailable_reason(
     session: Option<&MediaSessionV1>,
     kind: LiveAudioKind,
 ) -> &'static str {
-    match session.map(|plane| &plane.state) {
-        Some(MediaSessionStateV1::Failed { reason }) => media_failure_unavailable_label(*reason),
-        Some(MediaSessionStateV1::Reconnecting { .. }) => media_reconnecting_unavailable_label(),
-        Some(MediaSessionStateV1::DeviceAbsent {
-            track: MediaTrackKind::Audio,
-        }) => "Unavailable: no microphone is bound on the live media session",
-        Some(MediaSessionStateV1::PermissionDenied {
-            track: MediaTrackKind::Audio,
-        }) => "Unavailable: microphone permission denied on the live media session",
-        Some(MediaSessionStateV1::DeviceAbsent {
-            track: MediaTrackKind::Video | MediaTrackKind::Screen,
-        })
-        | Some(MediaSessionStateV1::PermissionDenied {
-            track: MediaTrackKind::Video | MediaTrackKind::Screen,
-        })
-        | Some(MediaSessionStateV1::Negotiating)
-        | Some(MediaSessionStateV1::Connected) => match kind {
-            LiveAudioKind::Mute => {
-                "Unavailable: mute has no bound audio sender on this media session"
+    match session {
+        Some(session) => {
+            if let Some(label) = session_ladder_unavailable_label(session) {
+                return label;
             }
-            LiveAudioKind::Dtmf => {
-                "Unavailable: DTMF has no bound audio sender on this media session"
+            match &session.state {
+                MediaSessionStateV1::DeviceAbsent {
+                    track: MediaTrackKind::Audio,
+                } => "Unavailable: no microphone is bound on the live media session",
+                MediaSessionStateV1::PermissionDenied {
+                    track: MediaTrackKind::Audio,
+                } => "Unavailable: microphone permission denied on the live media session",
+                MediaSessionStateV1::DeviceAbsent {
+                    track: MediaTrackKind::Video | MediaTrackKind::Screen,
+                }
+                | MediaSessionStateV1::PermissionDenied {
+                    track: MediaTrackKind::Video | MediaTrackKind::Screen,
+                }
+                | MediaSessionStateV1::Negotiating
+                | MediaSessionStateV1::Connected
+                | MediaSessionStateV1::Failed { .. }
+                | MediaSessionStateV1::Reconnecting { .. } => match kind {
+                    LiveAudioKind::Mute => {
+                        "Unavailable: mute has no bound audio sender on this media session"
+                    }
+                    LiveAudioKind::Dtmf => {
+                        "Unavailable: DTMF has no bound audio sender on this media session"
+                    }
+                },
             }
-        },
+        }
         None => media_failure_unavailable_label(MediaFailureReasonV1::TransportUnavailable),
     }
 }
@@ -1132,20 +1231,37 @@ fn outgoing_track_unavailable_reason(
     session: Option<&MediaSessionV1>,
     track: MediaTrackKind,
 ) -> &'static str {
-    match session.map(|plane| &plane.state) {
-        Some(MediaSessionStateV1::Failed { reason }) => media_failure_unavailable_label(*reason),
-        Some(MediaSessionStateV1::Reconnecting { .. }) => media_reconnecting_unavailable_label(),
-        Some(MediaSessionStateV1::DeviceAbsent { track: absent }) if *absent == track => {
-            device_absent_unavailable_label(track)
+    match session {
+        Some(session) => {
+            if let Some(label) = session_ladder_unavailable_label(session) {
+                return label;
+            }
+            match &session.state {
+                MediaSessionStateV1::DeviceAbsent { track: absent } if *absent == track => {
+                    device_absent_unavailable_label(track)
+                }
+                MediaSessionStateV1::PermissionDenied { track: denied } if *denied == track => {
+                    permission_denied_unavailable_label(track)
+                }
+                MediaSessionStateV1::DeviceAbsent { .. }
+                | MediaSessionStateV1::PermissionDenied { .. }
+                | MediaSessionStateV1::Negotiating
+                | MediaSessionStateV1::Connected
+                | MediaSessionStateV1::Failed { .. }
+                | MediaSessionStateV1::Reconnecting { .. } => match track {
+                    MediaTrackKind::Video => {
+                        "Unavailable: no MediaSessionV1 projection has attached a camera track"
+                    }
+                    MediaTrackKind::Screen => {
+                        "Unavailable: no MediaSessionV1 projection has attached a screen track"
+                    }
+                    MediaTrackKind::Audio => {
+                        "Unavailable: no MediaSessionV1 projection has attached an audio track"
+                    }
+                },
+            }
         }
-        Some(MediaSessionStateV1::PermissionDenied { track: denied }) if *denied == track => {
-            permission_denied_unavailable_label(track)
-        }
-        Some(MediaSessionStateV1::DeviceAbsent { .. })
-        | Some(MediaSessionStateV1::PermissionDenied { .. })
-        | Some(MediaSessionStateV1::Negotiating)
-        | Some(MediaSessionStateV1::Connected)
-        | None => match track {
+        None => match track {
             MediaTrackKind::Video => {
                 "Unavailable: no MediaSessionV1 projection has attached a camera track"
             }
@@ -1180,38 +1296,89 @@ fn outgoing_track_status(
 }
 
 fn device_row_reason(session: Option<&MediaSessionV1>) -> &'static str {
-    match session.map(|plane| &plane.state) {
-        Some(MediaSessionStateV1::Failed { reason }) => media_failure_unavailable_label(*reason),
-        Some(MediaSessionStateV1::Reconnecting { .. }) => media_reconnecting_unavailable_label(),
-        Some(MediaSessionStateV1::DeviceAbsent { track }) => match track {
-            MediaTrackKind::Audio => {
-                "Provider devices unavailable: the live media session has no microphone."
+    match session {
+        Some(session) => {
+            if let Some(label) = session_ladder_unavailable_label(session) {
+                return label;
             }
-            MediaTrackKind::Video => {
-                "Provider devices unavailable: the live media session has no camera."
+            match &session.state {
+                MediaSessionStateV1::DeviceAbsent { track } => match track {
+                    MediaTrackKind::Audio => {
+                        "Provider devices unavailable: the live media session has no microphone."
+                    }
+                    MediaTrackKind::Video => {
+                        "Provider devices unavailable: the live media session has no camera."
+                    }
+                    MediaTrackKind::Screen => {
+                        "Provider devices unavailable: the live media session has no screen-capture source."
+                    }
+                },
+                MediaSessionStateV1::PermissionDenied { track } => match track {
+                    MediaTrackKind::Audio => {
+                        "Provider devices unavailable: microphone permission denied on the live media session."
+                    }
+                    MediaTrackKind::Video => {
+                        "Provider devices unavailable: camera permission denied on the live media session."
+                    }
+                    MediaTrackKind::Screen => {
+                        "Provider devices unavailable: screen-capture permission denied on the live media session."
+                    }
+                },
+                MediaSessionStateV1::Negotiating
+                | MediaSessionStateV1::Connected
+                | MediaSessionStateV1::Failed { .. }
+                | MediaSessionStateV1::Reconnecting { .. } => {
+                    if session.bound_devices.is_empty() {
+                        "Provider devices unavailable: no live media provider has published device \
+                         inventory to this Calls surface yet, so these selectors remain disabled."
+                    } else {
+                        "Seat capture devices published by the live media session."
+                    }
+                }
             }
-            MediaTrackKind::Screen => {
-                "Provider devices unavailable: the live media session has no screen-capture source."
-            }
-        },
-        Some(MediaSessionStateV1::PermissionDenied { track }) => match track {
-            MediaTrackKind::Audio => {
-                "Provider devices unavailable: microphone permission denied on the live media session."
-            }
-            MediaTrackKind::Video => {
-                "Provider devices unavailable: camera permission denied on the live media session."
-            }
-            MediaTrackKind::Screen => {
-                "Provider devices unavailable: screen-capture permission denied on the live media session."
-            }
-        },
-        Some(MediaSessionStateV1::Negotiating)
-        | Some(MediaSessionStateV1::Connected)
-        | None => {
+        }
+        None => {
             "Provider devices unavailable: no live media provider has published device \
              inventory to this Calls surface yet, so these selectors remain disabled."
         }
     }
+}
+
+/// Operator-visible reconnecting/failed label. Recovery names the reason when
+/// present; a bare reconnecting session stays the generic reconnecting string.
+#[must_use]
+fn session_ladder_unavailable_label(session: &MediaSessionV1) -> Option<&'static str> {
+    match &session.state {
+        MediaSessionStateV1::Failed { reason } => Some(media_failure_unavailable_label(*reason)),
+        MediaSessionStateV1::Reconnecting { .. } => Some(
+            session
+                .recovery_reason()
+                .map(media_failure_unavailable_label)
+                .unwrap_or_else(media_reconnecting_unavailable_label),
+        ),
+        _ => None,
+    }
+}
+
+#[must_use]
+fn published_device_labels(session: Option<&MediaSessionV1>, kind: MediaTrackKind) -> Vec<String> {
+    session
+        .map(|plane| {
+            plane
+                .devices_for(kind)
+                .into_iter()
+                .map(|device| device.label.clone())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+#[must_use]
+fn selected_device_label(session: Option<&MediaSessionV1>, kind: MediaTrackKind) -> String {
+    session
+        .and_then(|plane| plane.selected_device(kind))
+        .map(|device| device.label.clone())
+        .unwrap_or_else(|| DEFAULT_DEVICE.to_owned())
 }
 
 /// The call card's header row: the kind glyph + label, the per-space (or direct)
@@ -1265,7 +1432,38 @@ fn call_roster_media_label(connected: usize, session: Option<&MediaSessionV1>) -
         Some(session) if matches!(session.state, MediaSessionStateV1::Negotiating) => {
             format!("· {connected} in call · media negotiating")
         }
-        Some(_) | None => format!("· {connected} in call · media unavailable"),
+        Some(session) if matches!(session.state, MediaSessionStateV1::Reconnecting { .. }) => {
+            match session.recovery_reason() {
+                Some(reason) => {
+                    format!(
+                        "· {connected} in call · reconnecting · {}",
+                        media_failure_roster_token(reason)
+                    )
+                }
+                None => format!("· {connected} in call · media reconnecting"),
+            }
+        }
+        Some(session) => match session.recovery_reason() {
+            Some(reason) => format!(
+                "· {connected} in call · {}",
+                media_failure_roster_token(reason)
+            ),
+            None => format!("· {connected} in call · media unavailable"),
+        },
+        None => format!("· {connected} in call · media unavailable"),
+    }
+}
+
+#[must_use]
+const fn media_failure_roster_token(reason: MediaFailureReasonV1) -> &'static str {
+    match reason {
+        MediaFailureReasonV1::TransportUnavailable => "media unavailable",
+        MediaFailureReasonV1::InvalidSignaling => "signaling failed",
+        MediaFailureReasonV1::PeerDropped => "peer dropped",
+        MediaFailureReasonV1::NegotiationTimeout => "negotiation timed out",
+        MediaFailureReasonV1::SfuUnreachable => "group host unreachable",
+        MediaFailureReasonV1::DeviceUnplugged => "device unplugged",
+        MediaFailureReasonV1::PermissionRevoked => "permission revoked",
     }
 }
 
@@ -1463,7 +1661,7 @@ mod tests {
         consume_voice_accounts, device_row_reason, live_audio_effect,
         live_audio_unavailable_reason, media_failure_unavailable_label, outgoing_track_effect,
         outgoing_track_unavailable_reason, sip_leg_live_failure, CallDevice, CallsPstnDrive,
-        LiveAudioEffect, LiveAudioKind, OutgoingTrackEffect,
+        LiveAudioEffect, LiveAudioKind, OutgoingTrackEffect, DEFAULT_DEVICE,
     };
     use crate::{
         ActivityAdminSnapshot, CommandSink, CommunicationsSurface, GatewayReadout,
@@ -1473,9 +1671,9 @@ mod tests {
         ActorClock, ActorId, CallId, CallKind, CallMediaAdapter, CallMediaAdmission,
         CallMediaReadiness, CallMediaRequirement, CallMediaSession, CallMediaVerification,
         CallParticipantState, CallParticipantView, CallView, CollabCommand, MediaDescriptionV1,
-        MediaFailureReasonV1, MediaSessionStateV1, MediaSessionV1, MediaSignalingRoleV1,
-        MediaTrackKind, SipLegDirectionV1, SipLegV1, SpaceDirectory, SpaceId, SpaceKind, SpaceRole,
-        SpaceSummary,
+        MediaDeviceV1, MediaFailureReasonV1, MediaRecoveryV1, MediaSessionStateV1, MediaSessionV1,
+        MediaSignalingRoleV1, MediaTrackKind, SipLegDirectionV1, SipLegV1, SpaceDirectory, SpaceId,
+        SpaceKind, SpaceRole, SpaceSummary,
     };
 
     fn plane_session(
@@ -2229,6 +2427,144 @@ mod tests {
                 .iter()
                 .any(|session| session.state.claims_live_media()),
             "Calls must not invent a live PSTN or LiveKit session from VoiceAccounts"
+        );
+    }
+
+    #[test]
+    fn published_devices_are_enumerated_without_inventing_a_bind() {
+        let call = CallId::new();
+        let live = plane_session(
+            call,
+            MediaSessionStateV1::Connected,
+            vec![MediaTrackKind::Audio, MediaTrackKind::Video],
+            false,
+            true,
+            true,
+            4,
+            true,
+        )
+        .with_bound_devices(vec![
+            MediaDeviceV1::new(MediaTrackKind::Audio, "Built-in-Mic", true, true).expect("mic"),
+            MediaDeviceV1::new(MediaTrackKind::Video, "FaceTime-HD", false, true).expect("cam"),
+        ])
+        .expect("inventory");
+        let mut surface = CommunicationsSurface::new();
+        surface.apply_media_sessions(vec![live.clone()]);
+        assert_eq!(surface.call_media.mic, "Built-in-Mic");
+        assert_eq!(surface.call_media.camera, DEFAULT_DEVICE);
+        assert_eq!(surface.call_media.screen, DEFAULT_DEVICE);
+        assert_eq!(
+            device_row_reason(Some(&live)),
+            "Seat capture devices published by the live media session."
+        );
+        assert_eq!(
+            CallDevice::Microphone.unavailable_reason_on_plane(Some(&live)),
+            "Seat capture devices published by the live media session; selection is worker-owned"
+        );
+        assert!(
+            !live.offers_redial(),
+            "a live session must not offer redial"
+        );
+
+        surface.apply_media_sessions(Vec::new());
+        assert_eq!(surface.call_media.mic, DEFAULT_DEVICE);
+        assert_eq!(
+            device_row_reason(None),
+            "Provider devices unavailable: no live media provider has published device \
+             inventory to this Calls surface yet, so these selectors remain disabled."
+        );
+    }
+
+    #[test]
+    fn failed_recovery_offers_redial_and_names_the_reason() {
+        let space = SpaceId::new();
+        let call = CallId::new();
+        let failed = plane_session(
+            call,
+            MediaSessionStateV1::Failed {
+                reason: MediaFailureReasonV1::PeerDropped,
+            },
+            vec![MediaTrackKind::Audio],
+            false,
+            false,
+            false,
+            0,
+            false,
+        )
+        .with_recovery(
+            MediaRecoveryV1::new(MediaFailureReasonV1::PeerDropped, 16, false, true)
+                .expect("redial"),
+        )
+        .expect("failed recovery");
+        assert!(failed.offers_redial());
+        assert_eq!(
+            call_roster_media_label(0, Some(&failed)),
+            "· 0 in call · peer dropped"
+        );
+        assert_eq!(
+            live_audio_unavailable_reason(Some(&failed), LiveAudioKind::Mute),
+            "Unavailable: the remote peer dropped"
+        );
+
+        let view = CallView {
+            call,
+            space,
+            kind: CallKind::Audio,
+            started_unix_ms: 1,
+            participants: vec![],
+        };
+        let surface = CommunicationsSurface::new();
+        let mut sink = CommandSink::new();
+        surface.redial_call(&mut sink, &view, Some(&failed), true);
+        assert!(
+            matches!(
+                sink.queued(),
+                [CollabCommand::StartCall {
+                    space: s,
+                    kind: CallKind::Audio,
+                    ..
+                }] if *s == space
+            ),
+            "redial must emit StartCall for the same space and kind"
+        );
+        let new_call = match sink.queued() {
+            [CollabCommand::StartCall { call: redial, .. }] => *redial,
+            other => panic!("expected StartCall, got {other:?}"),
+        };
+        assert_ne!(new_call, call, "redial must mint a new CallId");
+
+        let mut sink = CommandSink::new();
+        surface.redial_call(&mut sink, &view, Some(&failed), false);
+        assert!(
+            sink.is_empty(),
+            "redial must not emit when the space has no peer"
+        );
+
+        let reconnecting = plane_session(
+            call,
+            MediaSessionStateV1::Reconnecting { attempt: 2 },
+            vec![MediaTrackKind::Audio],
+            false,
+            false,
+            false,
+            0,
+            false,
+        )
+        .with_recovery(
+            MediaRecoveryV1::new(MediaFailureReasonV1::SfuUnreachable, 2, true, false)
+                .expect("auto"),
+        )
+        .expect("reconnecting");
+        assert!(!reconnecting.offers_redial());
+        assert_eq!(
+            call_roster_media_label(2, Some(&reconnecting)),
+            "· 2 in call · reconnecting · group host unreachable"
+        );
+        let mut sink = CommandSink::new();
+        surface.redial_call(&mut sink, &view, Some(&reconnecting), true);
+        assert!(
+            sink.is_empty(),
+            "reconnecting auto-retry must not emit a redial StartCall"
         );
     }
 }

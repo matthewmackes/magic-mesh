@@ -2,13 +2,16 @@
 //!
 //! These types are the only media facts allowed on the Bus. Offer/answer,
 //! track kind, mute, and session readiness travel as [`MediaSessionV1`] /
-//! [`MediaDescriptionV1`] — never as untyped JSON bags. The collab-bus sidecar
+//! [`MediaDescriptionV1`] — never as untyped JSON bags. Seat capture devices
+//! travel as [`MediaDeviceV1`] rows on that same session (S5 enumeration),
+//! never as a hardware path or untyped inventory bag. The collab-bus sidecar
 //! boards [`CallMediaReadiness`] / [`CallMediaVerification`] use the same
 //! bounded `from_json` admission so `state/collab/call-media-*` cannot carry a
 //! hostile bag. PSTN legs travel as [`SipLegV1`]. Mid-call honesty (peer drop,
 //! SFU loss, device unplug, permission revoke) is a [`MediaFailureReasonV1`]
-//! on the existing reconnecting/failed ladder — not a parallel schema. The
-//! crate is still pure: no I/O, no wall clock, no media stack. A
+//! on the existing reconnecting/failed ladder, with bounded auto-reconnect
+//! and a manual re-dial flag on [`MediaRecoveryV1`] (S6) — not a parallel
+//! schema. The crate is still pure: no I/O, no wall clock, no media stack. A
 //! [`MediaSessionStateV1::Connected`] or
 //! [`CallMediaVerificationStatus::LiveMediaVerified`] value is intrinsically
 //! invalid unless advancing frames were observed, so a hostile publisher
@@ -38,6 +41,10 @@ pub const MAX_MEDIA_DESCRIPTION_V1_JSON_BYTES: usize = 8 * 1024;
 pub const MAX_MEDIA_ACTOR_BYTES: usize = 128;
 /// Maximum tracks offered on one session (audio + camera + screen).
 pub const MAX_MEDIA_TRACKS: usize = 4;
+/// Maximum seat capture/playback devices retained on one session.
+pub const MAX_MEDIA_DEVICES: usize = 8;
+/// Maximum UTF-8 bytes in a published device label.
+pub const MAX_MEDIA_DEVICE_LABEL_BYTES: usize = 64;
 /// Maximum reconnect attempts retained on the wire.
 pub const MAX_MEDIA_RECONNECT_ATTEMPTS: u16 = 16;
 /// Prefix for the local media-readiness projection.
@@ -172,6 +179,125 @@ impl MediaFailureReasonV1 {
             Self::DeviceUnplugged => "device_unplugged",
             Self::PermissionRevoked => "permission_revoked",
         }
+    }
+}
+
+/// One seat capture/playback device published on [`MediaSessionV1`].
+///
+/// Labels are bounded tokens, never paths, URLs, commands, or ALSA/V4L
+/// device nodes. An empty inventory is the honest "not yet published" state;
+/// a selected-but-not-present row is mid-call unplug honesty, not a live bind.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaDeviceV1 {
+    /// Track this device can serve.
+    pub kind: MediaTrackKind,
+    /// Operator-visible label. Bounded; no path, URI, or secret.
+    pub label: String,
+    /// Whether the worker currently binds this device for `kind`.
+    pub selected: bool,
+    /// Whether the device is still attached to the seat.
+    pub present: bool,
+}
+
+impl MediaDeviceV1 {
+    /// Assemble an intrinsically valid device row.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the label is empty, oversized, or
+    /// carries a forbidden path/command/URI.
+    pub fn new(
+        kind: MediaTrackKind,
+        label: impl Into<String>,
+        selected: bool,
+        present: bool,
+    ) -> Result<Self, MediaSessionV1ValidationError> {
+        let device = Self {
+            kind,
+            label: label.into(),
+            selected,
+            present,
+        };
+        device.validate()?;
+        Ok(device)
+    }
+
+    /// Validate the intrinsic device-label contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field that fails admission.
+    pub fn validate(&self) -> Result<(), MediaSessionV1ValidationError> {
+        validate_device_label(&self.label)
+    }
+}
+
+/// Bounded mid-call recovery on [`MediaSessionV1`] (WL-FUNC-024 S6).
+///
+/// Auto-reconnect and manual re-dial are mutually exclusive: the worker is
+/// either still retrying, or it has given up and the operator may redial.
+/// This document never claims live media.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediaRecoveryV1 {
+    /// Why the live leg dropped. Same closed set as [`MediaFailureReasonV1`].
+    pub reason: MediaFailureReasonV1,
+    /// One-based attempt count, bounded by [`MAX_MEDIA_RECONNECT_ATTEMPTS`].
+    pub attempt: u16,
+    /// `true` while the worker is still auto-reconnecting.
+    pub auto_reconnect: bool,
+    /// `true` when auto-reconnect is exhausted and a manual re-dial is offered.
+    pub redial_offered: bool,
+}
+
+impl MediaRecoveryV1 {
+    /// Assemble an intrinsically valid recovery document.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when the attempt is out of bounds or both
+    /// auto-reconnect and re-dial are claimed together.
+    pub fn new(
+        reason: MediaFailureReasonV1,
+        attempt: u16,
+        auto_reconnect: bool,
+        redial_offered: bool,
+    ) -> Result<Self, MediaSessionV1ValidationError> {
+        let recovery = Self {
+            reason,
+            attempt,
+            auto_reconnect,
+            redial_offered,
+        };
+        recovery.validate()?;
+        Ok(recovery)
+    }
+
+    /// Validate the intrinsic recovery contract.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first field that fails admission.
+    pub fn validate(&self) -> Result<(), MediaSessionV1ValidationError> {
+        if self.attempt == 0 || self.attempt > MAX_MEDIA_RECONNECT_ATTEMPTS {
+            return Err(MediaSessionV1ValidationError::OutOfBounds {
+                field: "recovery.attempt",
+                max: u64::from(MAX_MEDIA_RECONNECT_ATTEMPTS),
+            });
+        }
+        if self.auto_reconnect && self.redial_offered {
+            return Err(MediaSessionV1ValidationError::InvalidField { field: "recovery" });
+        }
+        Ok(())
+    }
+
+    /// Recovery is never live media. Kept as a method so a caller cannot treat
+    /// a reconnecting/redial document as frames.
+    #[must_use]
+    pub const fn claims_live_media(&self) -> bool {
+        let _ = self;
+        false
     }
 }
 
@@ -730,6 +856,14 @@ pub struct MediaSessionV1 {
     pub audio_bound: bool,
     /// Advancing audio frames observed on the live or loopback seam.
     pub frames_observed: u64,
+    /// Seat capture/playback devices the worker published for this session.
+    /// Empty is the honest "not yet enumerated" state — never invented hardware.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub bound_devices: Vec<MediaDeviceV1>,
+    /// Mid-call recovery (S6). Absent on connected/negotiating and on
+    /// start-of-session device-absent / permission-denied. Never live media.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery: Option<MediaRecoveryV1>,
     /// Local offer or answer, when minted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub local_description: Option<MediaDescriptionV1>,
@@ -773,6 +907,8 @@ impl MediaSessionV1 {
             dtmf_bound,
             audio_bound,
             frames_observed,
+            bound_devices: Vec::new(),
+            recovery: None,
             local_description,
             remote_description,
         };
@@ -813,6 +949,76 @@ impl MediaSessionV1 {
     #[must_use]
     pub fn offered_live_track(&self, track: MediaTrackKind) -> bool {
         self.claims_live_media() && self.offered_tracks.contains(&track)
+    }
+
+    /// Bind a worker-published device inventory. Empty is honest (not yet
+    /// enumerated). Does not invent a connected claim.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when a label is hostile or two devices of
+    /// the same kind are selected.
+    pub fn with_bound_devices(
+        mut self,
+        bound_devices: Vec<MediaDeviceV1>,
+    ) -> Result<Self, MediaSessionV1ValidationError> {
+        self.bound_devices = bound_devices;
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// Bind a mid-call recovery document. Connected and start-of-session
+    /// unavailable states reject recovery.
+    ///
+    /// # Errors
+    ///
+    /// Returns a validation error when recovery disagrees with `state`.
+    pub fn with_recovery(
+        mut self,
+        recovery: MediaRecoveryV1,
+    ) -> Result<Self, MediaSessionV1ValidationError> {
+        self.recovery = Some(recovery);
+        self.validate()?;
+        Ok(self)
+    }
+
+    /// The selected device for `kind`, if the worker published one.
+    #[must_use]
+    pub fn selected_device(&self, kind: MediaTrackKind) -> Option<&MediaDeviceV1> {
+        self.bound_devices
+            .iter()
+            .find(|device| device.kind == kind && device.selected)
+    }
+
+    /// Published devices for `kind`, in wire order.
+    #[must_use]
+    pub fn devices_for(&self, kind: MediaTrackKind) -> Vec<&MediaDeviceV1> {
+        self.bound_devices
+            .iter()
+            .filter(|device| device.kind == kind)
+            .collect()
+    }
+
+    /// Operator-visible reason on the reconnecting/failed ladder, if named.
+    #[must_use]
+    pub const fn recovery_reason(&self) -> Option<MediaFailureReasonV1> {
+        match (&self.state, &self.recovery) {
+            (MediaSessionStateV1::Failed { reason }, _) => Some(*reason),
+            (MediaSessionStateV1::Reconnecting { .. }, Some(recovery)) => Some(recovery.reason),
+            _ => None,
+        }
+    }
+
+    /// Manual re-dial is offered only after auto-reconnect is exhausted on a
+    /// failed session. Reconnecting is still the worker's retry, not a redial.
+    #[must_use]
+    pub fn offers_redial(&self) -> bool {
+        match (&self.state, &self.recovery) {
+            (MediaSessionStateV1::Failed { .. }, Some(recovery)) => {
+                recovery.redial_offered && !self.claims_live_media()
+            }
+            _ => false,
+        }
     }
 
     /// Decode and admit a bounded JSON session body.
@@ -940,6 +1146,8 @@ impl MediaSessionV1 {
             }
             MediaSessionStateV1::Failed { .. } | MediaSessionStateV1::Negotiating => {}
         }
+        validate_bound_devices(&self.bound_devices)?;
+        validate_recovery_pairing(&self.state, self.recovery.as_ref())?;
         Ok(())
     }
 }
@@ -1114,6 +1322,84 @@ fn looks_forbidden(value: &str) -> bool {
         || lower.contains("password")
         || lower.contains("secret")
         || lower.contains("token=")
+}
+
+fn validate_device_label(label: &str) -> Result<(), MediaSessionV1ValidationError> {
+    if label.is_empty() || label.len() > MAX_MEDIA_DEVICE_LABEL_BYTES {
+        return Err(MediaSessionV1ValidationError::OutOfBounds {
+            field: "bound_devices.label",
+            max: MAX_MEDIA_DEVICE_LABEL_BYTES as u64,
+        });
+    }
+    if looks_forbidden(label)
+        || label.contains('/')
+        || label.contains('\\')
+        || label.contains('@')
+        || label.contains(':')
+        || label
+            .bytes()
+            .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+    {
+        return Err(MediaSessionV1ValidationError::ForbiddenValue {
+            field: "bound_devices.label",
+        });
+    }
+    Ok(())
+}
+
+fn validate_bound_devices(devices: &[MediaDeviceV1]) -> Result<(), MediaSessionV1ValidationError> {
+    if devices.len() > MAX_MEDIA_DEVICES {
+        return Err(MediaSessionV1ValidationError::OutOfBounds {
+            field: "bound_devices",
+            max: MAX_MEDIA_DEVICES as u64,
+        });
+    }
+    let mut selected = [false; 3];
+    for device in devices {
+        device.validate()?;
+        if device.selected {
+            let index = match device.kind {
+                MediaTrackKind::Audio => 0,
+                MediaTrackKind::Video => 1,
+                MediaTrackKind::Screen => 2,
+            };
+            if selected[index] {
+                return Err(MediaSessionV1ValidationError::InvalidField {
+                    field: "bound_devices",
+                });
+            }
+            selected[index] = true;
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_pairing(
+    state: &MediaSessionStateV1,
+    recovery: Option<&MediaRecoveryV1>,
+) -> Result<(), MediaSessionV1ValidationError> {
+    match (state, recovery) {
+        (MediaSessionStateV1::Connected | MediaSessionStateV1::Negotiating, Some(_))
+        | (
+            MediaSessionStateV1::DeviceAbsent { .. } | MediaSessionStateV1::PermissionDenied { .. },
+            Some(_),
+        ) => Err(MediaSessionV1ValidationError::InvalidField { field: "recovery" }),
+        (MediaSessionStateV1::Reconnecting { attempt }, Some(recovery)) => {
+            recovery.validate()?;
+            if recovery.attempt != *attempt || !recovery.auto_reconnect || recovery.redial_offered {
+                return Err(MediaSessionV1ValidationError::InvalidField { field: "recovery" });
+            }
+            Ok(())
+        }
+        (MediaSessionStateV1::Failed { reason }, Some(recovery)) => {
+            recovery.validate()?;
+            if recovery.reason != *reason || recovery.auto_reconnect {
+                return Err(MediaSessionV1ValidationError::InvalidField { field: "recovery" });
+            }
+            Ok(())
+        }
+        (_, None) => Ok(()),
+    }
 }
 
 fn validate_sip_actor(field: &'static str, actor: &ActorId) -> Result<(), SipLegV1ValidationError> {
@@ -2369,5 +2655,129 @@ mod tests {
             CallMediaVerification::from_json_bytes(&verification_body),
             Err(CallMediaBoardDecodeError::BodyTooLarge { .. })
         ));
+    }
+
+    #[test]
+    fn published_devices_round_trip_and_select_one_per_kind() {
+        let mic =
+            MediaDeviceV1::new(MediaTrackKind::Audio, "Built-in-Mic", true, true).expect("mic");
+        let cam =
+            MediaDeviceV1::new(MediaTrackKind::Video, "FaceTime-HD", true, true).expect("cam");
+        let session = sample_session()
+            .with_bound_devices(vec![mic.clone(), cam.clone()])
+            .expect("devices admit");
+        let body = serde_json::to_string(&session).expect("json");
+        let decoded = MediaSessionV1::from_json(&body).expect("admit devices");
+        assert_eq!(decoded.selected_device(MediaTrackKind::Audio), Some(&mic));
+        assert_eq!(decoded.selected_device(MediaTrackKind::Video), Some(&cam));
+        assert!(decoded.selected_device(MediaTrackKind::Screen).is_none());
+        assert_eq!(decoded.devices_for(MediaTrackKind::Audio).len(), 1);
+        assert!(!body.contains("/dev/"));
+        assert!(!decoded.offers_redial());
+    }
+
+    #[test]
+    fn omitted_device_and_recovery_fields_still_admit() {
+        let session = sample_session();
+        let body = serde_json::to_string(&session).expect("json");
+        assert!(
+            !body.contains("bound_devices"),
+            "empty inventory must omit the field"
+        );
+        assert!(
+            !body.contains("recovery"),
+            "absent recovery must omit the field"
+        );
+        let decoded = MediaSessionV1::from_json(&body).expect("old session still admits");
+        assert!(decoded.bound_devices.is_empty());
+        assert!(decoded.recovery.is_none());
+    }
+
+    #[test]
+    fn hostile_device_labels_and_double_select_fail_closed() {
+        for label in [
+            "",
+            "/dev/snd/pcmC0D0p",
+            "hw:0,0",
+            "https://evil.invalid",
+            "alice@sip.invalid",
+            "token=abc",
+            "password",
+            "default microphone",
+            "mic\nline",
+        ] {
+            assert!(
+                MediaDeviceV1::new(MediaTrackKind::Audio, label, true, true).is_err(),
+                "label {label:?} must fail"
+            );
+        }
+        let first = MediaDeviceV1::new(MediaTrackKind::Audio, "Mic-A", true, true).expect("a");
+        let second = MediaDeviceV1::new(MediaTrackKind::Audio, "Mic-B", true, true).expect("b");
+        assert!(sample_session()
+            .with_bound_devices(vec![first, second])
+            .is_err());
+    }
+
+    #[test]
+    fn s6_recovery_names_reason_and_offers_redial_only_on_failed() {
+        let recovery = MediaRecoveryV1::new(MediaFailureReasonV1::PeerDropped, 1, true, false)
+            .expect("auto-reconnect");
+        assert!(!recovery.claims_live_media());
+        let reconnecting = unavailable(MediaSessionStateV1::Reconnecting { attempt: 1 })
+            .with_recovery(recovery)
+            .expect("reconnecting recovery");
+        assert_eq!(
+            reconnecting.recovery_reason(),
+            Some(MediaFailureReasonV1::PeerDropped)
+        );
+        assert!(!reconnecting.offers_redial());
+        assert!(!reconnecting.claims_live_media());
+
+        let failed = unavailable(MediaSessionStateV1::Failed {
+            reason: MediaFailureReasonV1::SfuUnreachable,
+        })
+        .with_recovery(
+            MediaRecoveryV1::new(MediaFailureReasonV1::SfuUnreachable, 16, false, true)
+                .expect("redial"),
+        )
+        .expect("failed recovery");
+        assert!(failed.offers_redial());
+        assert_eq!(
+            failed.recovery_reason(),
+            Some(MediaFailureReasonV1::SfuUnreachable)
+        );
+        let body = serde_json::to_string(&failed).expect("json");
+        let decoded = MediaSessionV1::from_json(&body).expect("admit recovery");
+        assert!(decoded.offers_redial());
+        assert!(!decoded.claims_live_media());
+    }
+
+    #[test]
+    fn connected_and_start_of_session_reject_recovery_and_dual_flags() {
+        assert!(sample_session()
+            .with_recovery(
+                MediaRecoveryV1::new(MediaFailureReasonV1::PeerDropped, 1, false, true,)
+                    .expect("recovery")
+            )
+            .is_err());
+        assert!(unavailable(MediaSessionStateV1::DeviceAbsent {
+            track: MediaTrackKind::Audio,
+        })
+        .with_recovery(
+            MediaRecoveryV1::new(MediaFailureReasonV1::DeviceUnplugged, 1, false, true,)
+                .expect("recovery")
+        )
+        .is_err());
+        assert!(MediaRecoveryV1::new(MediaFailureReasonV1::PeerDropped, 1, true, true,).is_err());
+        assert!(MediaRecoveryV1::new(MediaFailureReasonV1::PeerDropped, 0, true, false,).is_err());
+
+        let mismatched = unavailable(MediaSessionStateV1::Failed {
+            reason: MediaFailureReasonV1::PeerDropped,
+        })
+        .with_recovery(
+            MediaRecoveryV1::new(MediaFailureReasonV1::SfuUnreachable, 1, false, true)
+                .expect("other reason"),
+        );
+        assert!(mismatched.is_err());
     }
 }

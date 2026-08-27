@@ -32,13 +32,16 @@
 //! # Mesh share-session (WL-FUNC-031)
 //!
 //! A **Share** control on the focused document starts a [`CollabSession`] into a
-//! chosen member space. Peers join from the space's live-session picker, the
-//! participant roster offers a follow-mode toggle (wired through the editor's
-//! existing `follow` / [`follow_banner`] APIs), and the owner can close the
-//! session — which detaches every follower. Non-members and closed sessions
+//! chosen member space. Peers join from the space's live-session picker with
+//! **edit** (default) or **view-only** permission; the owner can toggle a
+//! participant between view and edit on the roster. The participant list offers
+//! a follow-mode toggle (wired through the editor's existing `follow` /
+//! [`follow_banner`] APIs), and the owner can close the session — which detaches
+//! every follower. Non-members, closed sessions, and view-only local edits
 //! refuse honestly. CollabCommand has no share/join/follow/close variants, so
 //! this UI crate emits a local [`DocumentShareCommand`] through
-//! [`DocumentShareSink`].
+//! [`DocumentShareSink`]. View/edit grant rides the live session's `Grant`
+//! frame (no new drain variant — the shell match is closed).
 //!
 //! External file changes merge against the **last shared base** instead of
 //! overwriting the live CRDT buffer; a concurrent write that cannot merge
@@ -54,7 +57,7 @@ use mde_collab_types::{
     CollabCommand, DocumentChange, DocumentId, DocumentSession, PayloadRef, ReviewVerdict, SpaceId,
 };
 use mde_editor_egui::{
-    editor_panel, follow_banner, markdown, real_editor, BusTransport, CollabSession,
+    editor_panel, follow_banner, markdown, real_editor, Access, BusTransport, CollabSession,
     CollabTransport, EditorSurface, FakeBus, FollowUpdate, Role, SessionId,
 };
 
@@ -338,6 +341,14 @@ fn host_peer_from_session(data: &dyn CollabData, space: SpaceId, document: Docum
                 .map(str::to_owned)
         })
         .unwrap_or_default()
+}
+
+fn share_access_label(access: Access) -> &'static str {
+    if access.can_edit() {
+        "edit"
+    } else {
+        "view"
+    }
 }
 
 /// Characters that can change the visual direction or structure of a Documents
@@ -672,8 +683,24 @@ impl DocumentsState {
         let Some(live) = share.as_mut() else {
             return SharePumpOutcome::default();
         };
-        if let Some(text) = editor.current_text() {
-            mirror_local_text_into_session(&mut live.session, &text);
+        let mut refused_edit = false;
+        let pending_guest_catch_up =
+            live.session.doc().to_text().is_empty() && live.session.role() == Role::Guest;
+        if live.session.can_edit() && !pending_guest_catch_up {
+            if let Some(text) = editor.current_text() {
+                mirror_local_text_into_session(&mut live.session, &text);
+            }
+        } else if !live.session.can_edit() {
+            if let Some(text) = editor.current_text() {
+                let crdt = live.session.doc().to_text();
+                // A view-only guest starts with an empty CRDT and catches up
+                // through the handshake. Do not treat the still-loaded editor
+                // body as a refused edit, and do not wipe it before Sync arrives.
+                if text != crdt && !pending_guest_catch_up {
+                    let _ = live.session.note_local_input();
+                    refused_edit = true;
+                }
+            }
         }
         live.session.set_cursor(editor.current_cursor());
         live.session.set_viewport(editor.current_viewport());
@@ -714,6 +741,8 @@ impl DocumentsState {
             follow: outcome.follow,
             host_left,
             follow_ended: outcome.follow_ended,
+            refused_edit,
+            access_changed: outcome.access_changed,
         }
     }
 
@@ -741,6 +770,8 @@ struct SharePumpOutcome {
     follow: Option<FollowUpdate>,
     host_left: bool,
     follow_ended: bool,
+    refused_edit: bool,
+    access_changed: bool,
 }
 
 impl CommunicationsSurface {
@@ -949,10 +980,11 @@ impl CommunicationsSurface {
 
         // The session picker: the space's live documents (read model), plus the
         // honest empty state when the space has none yet. Clicking a live session
-        // opens it and joins the mesh share-session when this seat is a member.
+        // opens it and joins as edit; the view icon joins view-only when this
+        // seat is a member.
         ui.horizontal_wrapped(|ui| {
             ui.label(egui::RichText::new("Open:").small().color(Style::TEXT_DIM));
-            let mut pick: Option<(DocumentId, String)> = None;
+            let mut pick: Option<(DocumentId, String, Access)> = None;
             match data.document_sessions(space) {
                 Some(sessions) if !sessions.sessions.is_empty() => {
                     for session in &sessions.sessions {
@@ -963,7 +995,18 @@ impl CommunicationsSurface {
                         if ui.selectable_label(selected, &title).clicked() {
                             // Title is display-only state, not part of the canonical
                             // Markdown command payload, so keep the click path bounded.
-                            pick = Some((session.document, title));
+                            pick = Some((session.document, title.clone(), Access::ReadWrite));
+                        }
+                        if icons::icon_button(
+                            ui,
+                            icons::DOC_VIEW_VISUAL,
+                            Style::SP_M,
+                            Style::TEXT_DIM,
+                            "Join this share as view-only",
+                        )
+                        .clicked()
+                        {
+                            pick = Some((session.document, title, Access::ReadOnly));
                         }
                     }
                 }
@@ -975,9 +1018,9 @@ impl CommunicationsSurface {
                     );
                 }
             }
-            if let Some((document, title)) = pick {
+            if let Some((document, title, access)) = pick {
                 self.open_document(data, document, title);
-                let _ = self.join_document_share(data, space, document);
+                let _ = self.join_document_share_as(data, space, document, access);
             }
         });
 
@@ -1039,6 +1082,7 @@ impl CommunicationsSurface {
         };
         let me = data.me().as_str().to_owned();
         let owner = live.session.role() == Role::Host;
+        let my_access = live.session.access();
         let following = live.session.following().map(str::to_owned);
         let follow_name = following.as_ref().and_then(|peer| {
             live.session
@@ -1047,11 +1091,11 @@ impl CommunicationsSurface {
                 .map(|remote| remote.presence.name.clone())
                 .or_else(|| Some(peer.clone()))
         });
-        let mut peers: Vec<(String, String)> = live
+        let mut peers: Vec<(String, String, Access)> = live
             .session
             .peers()
             .iter()
-            .map(|(id, remote)| (id.clone(), remote.presence.name.clone()))
+            .map(|(id, remote)| (id.clone(), remote.presence.name.clone(), remote.access))
             .collect();
         peers.sort_by(|a, b| a.0.cmp(&b.0));
         drop(live);
@@ -1064,15 +1108,20 @@ impl CommunicationsSurface {
                     .color(Style::TEXT_STRONG),
             );
             ui.label(
-                egui::RichText::new(format!("{me} (you)"))
+                egui::RichText::new(format!("{me} (you, {})", share_access_label(my_access)))
                     .small()
                     .color(Style::TEXT),
             );
             let mut follow_peer: Option<String> = None;
             let mut unfollow = false;
-            for (id, name) in &peers {
+            let mut grant_peer: Option<(String, Access)> = None;
+            for (id, name, access) in &peers {
                 let label = bounded_document_display(name, MAX_DOCUMENT_TITLE_CHARS);
-                ui.label(egui::RichText::new(&label).small().color(Style::TEXT));
+                ui.label(
+                    egui::RichText::new(format!("{label} ({})", share_access_label(*access)))
+                        .small()
+                        .color(Style::TEXT),
+                );
                 let is_following = following.as_deref() == Some(id.as_str());
                 let hint = if is_following {
                     "Stop following this participant"
@@ -1089,6 +1138,24 @@ impl CommunicationsSurface {
                         unfollow = true;
                     } else {
                         follow_peer = Some(id.clone());
+                    }
+                }
+                if owner {
+                    let next = if access.can_edit() {
+                        Access::ReadOnly
+                    } else {
+                        Access::ReadWrite
+                    };
+                    let (icon, hint) = if access.can_edit() {
+                        (
+                            icons::DOC_VIEW_VISUAL,
+                            "Switch this participant to view-only",
+                        )
+                    } else {
+                        (icons::EDIT, "Switch this participant to edit")
+                    };
+                    if icons::icon_button(ui, icon, Style::SP_M, Style::TEXT_DIM, hint).clicked() {
+                        grant_peer = Some((id.clone(), next));
                     }
                 }
             }
@@ -1109,6 +1176,9 @@ impl CommunicationsSurface {
             }
             if unfollow {
                 let _ = self.unfollow_share_peer();
+            }
+            if let Some((peer, access)) = grant_peer {
+                let _ = self.grant_share_peer(&peer, access);
             }
         });
 
@@ -1453,6 +1523,26 @@ impl CommunicationsSurface {
             .unwrap_or_default()
     }
 
+    /// This seat's view/edit permission on the attached share-session.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn document_share_access(&self) -> Option<Access> {
+        self.documents
+            .share
+            .as_ref()
+            .map(|live| live.session.access())
+    }
+
+    /// A remote peer's view/edit permission as this seat last observed it.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn document_share_peer_access(&self, peer: &str) -> Option<Access> {
+        self.documents
+            .share
+            .as_ref()
+            .and_then(|live| live.session.peers().get(peer).map(|remote| remote.access))
+    }
+
     /// Typed external-write conflict, if a concurrent write could not merge.
     #[must_use]
     pub(crate) fn external_write_conflict(&self) -> Option<&ExternalWriteConflict> {
@@ -1541,13 +1631,27 @@ impl CommunicationsSurface {
         true
     }
 
-    /// Join the live share-session for `document` in `space` as a guest. Closed
-    /// sessions and non-members refuse honestly.
+    /// Join the live share-session for `document` in `space` as a guest with
+    /// edit permission. Closed sessions and non-members refuse honestly.
     pub(crate) fn join_document_share(
         &mut self,
         data: &dyn CollabData,
         space: SpaceId,
         document: DocumentId,
+    ) -> bool {
+        self.join_document_share_as(data, space, document, Access::ReadWrite)
+    }
+
+    /// Join the live share-session for `document` in `space` as a guest with
+    /// `access` (edit or view-only). Closed sessions and non-members refuse
+    /// honestly. View-only refuses local edits immediately; the owner can later
+    /// grant edit over the wire.
+    pub(crate) fn join_document_share_as(
+        &mut self,
+        data: &dyn CollabData,
+        space: SpaceId,
+        document: DocumentId,
+        access: Access,
     ) -> bool {
         if !is_space_member(data, space) {
             self.documents.notice =
@@ -1575,7 +1679,8 @@ impl CommunicationsSurface {
             }
             self.documents.detach_share("");
         }
-        let mut session = CollabSession::guest(session_id.clone(), data.me().as_str());
+        let mut session =
+            CollabSession::guest(session_id.clone(), data.me().as_str()).with_access(access);
         session.join(&self.documents.share_transport);
         self.documents.share = Some(LiveShare {
             space,
@@ -1596,7 +1701,11 @@ impl CommunicationsSurface {
         if self.documents.share.is_none() {
             return false;
         }
-        self.documents.notice = Some("Joined share session.".to_owned());
+        self.documents.notice = Some(if access.can_edit() {
+            "Joined share session.".to_owned()
+        } else {
+            "Joined share session as view-only.".to_owned()
+        });
         true
     }
 
@@ -1634,6 +1743,31 @@ impl CommunicationsSurface {
             .share_commands
             .emit(DocumentShareCommand::Unfollow { document });
         self.documents.notice = Some("Stopped following.".to_owned());
+        true
+    }
+
+    /// Owner grants `access` (view or edit) to `peer`. Guests are refused.
+    /// Rides the live session `Grant` frame — no new [`DocumentShareCommand`]
+    /// variant (the shell drain match is closed).
+    pub(crate) fn grant_share_peer(&mut self, peer: &str, access: Access) -> bool {
+        let Some(live) = self.documents.share.as_mut() else {
+            self.documents.notice = Some("Join a share session before granting.".to_owned());
+            return false;
+        };
+        if !live.owner {
+            self.documents.notice =
+                Some("Only the share owner can change view/edit permission.".to_owned());
+            return false;
+        }
+        if !live
+            .session
+            .grant(peer, access, &self.documents.share_transport)
+        {
+            self.documents.notice =
+                Some("Only the share owner can change view/edit permission.".to_owned());
+            return false;
+        }
+        self.documents.notice = Some(format!("{peer} is now {}.", share_access_label(access)));
         true
     }
 
@@ -1704,7 +1838,15 @@ impl CommunicationsSurface {
         let outcome = self.documents.pump_share();
         if let Some(crdt_text) = outcome.crdt_text.as_ref() {
             if self.documents.editor.current_text().as_deref() != Some(crdt_text.as_str()) {
-                self.documents.editor.replace_text(crdt_text);
+                let pending_guest_catch_up = crdt_text.is_empty()
+                    && self
+                        .documents
+                        .share
+                        .as_ref()
+                        .is_some_and(|live| live.session.role() == Role::Guest);
+                if !pending_guest_catch_up {
+                    self.documents.editor.replace_text(crdt_text);
+                }
             }
         }
         if let Some(update) = outcome.follow.as_ref() {
@@ -1715,7 +1857,20 @@ impl CommunicationsSurface {
                 .detach_share("Share session closed by its owner — followers detached.");
             return;
         }
-        if outcome.follow_ended {
+        if outcome.refused_edit {
+            self.documents.notice = Some("Cannot edit: this share is view-only.".to_owned());
+        } else if outcome.access_changed {
+            let can_edit = self
+                .documents
+                .share
+                .as_ref()
+                .is_some_and(|live| live.session.can_edit());
+            self.documents.notice = Some(if can_edit {
+                "Share permission: edit.".to_owned()
+            } else {
+                "Share permission: view-only.".to_owned()
+            });
+        } else if outcome.follow_ended {
             self.documents.notice = Some("Stopped following — that participant left.".to_owned());
         }
     }
@@ -1734,6 +1889,17 @@ impl CommunicationsSurface {
             return;
         };
         if self.documents.last_seen_external.as_deref() == Some(external) {
+            return;
+        }
+        if self
+            .documents
+            .share
+            .as_ref()
+            .is_some_and(|live| live.document == document && !live.session.can_edit())
+        {
+            // View-only: the CRDT is the document. Record the snapshot so the
+            // same body does not re-enter, and do not clobber the shared rope.
+            self.documents.last_seen_external = Some(external.to_owned());
             return;
         }
         let live = self.documents.editor.current_text().unwrap_or_default();
@@ -2598,5 +2764,228 @@ mod tests {
             host_text.contains("host") && host_text.contains("guest"),
             "neither seat's line may be silently dropped, got {host_text:?}"
         );
+    }
+
+    #[test]
+    fn view_only_join_refuses_local_edits_and_keeps_the_shared_document() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+        use mde_editor_egui::Access;
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
+        let guest_data = share_fixture("falcon", space, document, &["eagle", "falcon"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share_as(&guest_data, space, document, Access::ReadOnly));
+        assert_eq!(guest.document_share_access(), Some(Access::ReadOnly));
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("view-only")),
+            "view-only join must be honest, got {:?}",
+            guest.document_notice()
+        );
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            guest.document_editor_text().as_deref(),
+            host.document_editor_text().as_deref(),
+            "a view-only guest must still catch up"
+        );
+
+        guest.set_document_editor_text("# Runbook\nsneaky\n");
+        for _ in 0..6 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            host.document_editor_text().as_deref(),
+            Some("# Runbook\n"),
+            "a view-only edit must not reach the host"
+        );
+        assert_eq!(
+            guest.document_editor_text().as_deref(),
+            Some("# Runbook\n"),
+            "a view-only edit must be restored from the shared CRDT"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("view-only")),
+            "view-only edit must refuse honestly, got {:?}",
+            guest.document_notice()
+        );
+        assert_eq!(guest.following_share_peer(), None);
+    }
+
+    #[test]
+    fn owner_can_revoke_and_restore_edit_permission() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+        use mde_editor_egui::Access;
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
+        let guest_data = share_fixture("falcon", space, document, &["eagle", "falcon"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share(&guest_data, space, document));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(guest.document_share_access(), Some(Access::ReadWrite));
+        assert_eq!(
+            host.document_editor_text().as_deref(),
+            Some("# Runbook\n"),
+            "guest catch-up must not re-seed the host document"
+        );
+        assert_eq!(
+            guest.document_editor_text().as_deref(),
+            Some("# Runbook\n"),
+            "two seats must converge on the hosted body before a grant"
+        );
+
+        assert!(
+            !guest.grant_share_peer("eagle", Access::ReadOnly),
+            "a guest must not grant"
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("Only the share owner")),
+            "guest grant must refuse honestly, got {:?}",
+            guest.document_notice()
+        );
+        assert_eq!(guest.document_share_access(), Some(Access::ReadWrite));
+
+        assert!(host.grant_share_peer("falcon", Access::ReadOnly));
+        guest.pump_document_share();
+        assert_eq!(guest.document_share_access(), Some(Access::ReadOnly));
+        assert_eq!(
+            host.document_share_peer_access("falcon"),
+            Some(Access::ReadOnly)
+        );
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("view-only")),
+            "revoke must surface view-only, got {:?}",
+            guest.document_notice()
+        );
+
+        guest.set_document_editor_text("# Runbook\nrevoked\n");
+        for _ in 0..6 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            host.document_editor_text().as_deref(),
+            Some("# Runbook\n"),
+            "a revoked guest must not clobber the shared document"
+        );
+        assert_eq!(guest.document_editor_text().as_deref(), Some("# Runbook\n"));
+
+        assert!(host.grant_share_peer("falcon", Access::ReadWrite));
+        guest.pump_document_share();
+        assert_eq!(guest.document_share_access(), Some(Access::ReadWrite));
+        assert!(
+            guest
+                .document_notice()
+                .is_some_and(|notice| notice.contains("edit")),
+            "re-grant must surface edit, got {:?}",
+            guest.document_notice()
+        );
+
+        guest.set_document_editor_text("# Runbook\nrestored\n");
+        for _ in 0..6 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            host.document_editor_text().as_deref(),
+            Some("# Runbook\nrestored\n"),
+            "a re-granted guest must be able to edit"
+        );
+    }
+
+    #[test]
+    fn view_only_guest_still_follows_and_skips_external_clobber() {
+        use crate::CommunicationsSurface;
+        use mde_collab_types::{DocumentId, SpaceId};
+        use mde_editor_egui::Access;
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let host_data = share_fixture("eagle", space, document, &["eagle", "falcon"]);
+        let guest_data = share_fixture("falcon", space, document, &["eagle", "falcon"]);
+        let bus = mde_editor_egui::FakeBus::new();
+
+        let mut host = CommunicationsSurface::new();
+        host.bind_document_share_bus(bus.clone());
+        host.select_space(space);
+        host.open_document(&host_data, document, "Runbook");
+        assert!(host.share_document(&host_data, space));
+
+        let mut guest = CommunicationsSurface::new();
+        guest.bind_document_share_bus(bus);
+        guest.select_space(space);
+        guest.open_document(&guest_data, document, "Runbook");
+        assert!(guest.join_document_share_as(&guest_data, space, document, Access::ReadOnly));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+
+        host.set_document_editor_cursor(4);
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert!(guest.follow_share_peer("eagle"));
+        for _ in 0..4 {
+            host.pump_document_share();
+            guest.pump_document_share();
+        }
+        assert_eq!(
+            guest.document_editor_cursor(),
+            Some(mde_editor_egui::CursorPos::caret(4)),
+            "view-only follow must still replay the host caret"
+        );
+
+        let overlapping = share_fixture("falcon", space, document, &["eagle", "falcon"])
+            .with_document_body(document, "hello mesh\n");
+        guest.apply_external_document_body(&overlapping);
+        assert_eq!(
+            guest.document_editor_text().as_deref(),
+            Some("# Runbook\n"),
+            "a view-only attached share must not apply an external clobber"
+        );
+        assert!(guest.external_write_conflict().is_none());
     }
 }

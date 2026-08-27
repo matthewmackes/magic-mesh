@@ -1,10 +1,10 @@
 //! WL-FUNC-027 — bounded user Places bookmarks.
 //!
 //! Persist lives here so the Places user section does not share
-//! `model/mod.rs` with FolderPrefs (WL-FUNC-026). The session list the
-//! sidebar paints still comes from [`FileBrowser`](crate::model::FileBrowser)
-//! so pin/unpin/rename/reorder/remove stay on the existing apply path;
-//! this module is the JSON contract, path validation, and count cap.
+//! `model/mod.rs` with FolderPrefs (WL-FUNC-026). [`FileBrowser`](crate::model::FileBrowser)
+//! owns a [`BookmarkStore`] and pin/unpin/rename/reorder/remove go through it;
+//! the sidebar still reads the session list from the browser so dialogs and
+//! Places share one apply path.
 //!
 //! Store path: `<config>/mcnf/files-bookmarks.json` (`XDG_CONFIG_HOME`, else
 //! `$HOME/.config`). Tests inject a directory via [`BookmarkStore::open`].
@@ -99,6 +99,18 @@ pub struct BookmarkStore {
 }
 
 impl BookmarkStore {
+    /// In-memory store with no on-disk path. Tests construct a browser before
+    /// injecting a tempdir; production uses [`Self::from_env`].
+    #[must_use]
+    pub fn memory() -> Self {
+        Self {
+            path: None,
+            bookmarks: Vec::new(),
+            last_note: None,
+            dirty: false,
+        }
+    }
+
     /// Load from `dir/files-bookmarks.json` (the test injection the browser uses).
     #[must_use]
     pub fn open(dir: impl AsRef<Path>) -> Self {
@@ -514,6 +526,9 @@ mod tests {
             Path::new("/root/.config/mcnf/files-bookmarks.json")
         );
         assert_eq!(EMPTY_HINT, "Pin a folder to keep it here.");
+        let memory = BookmarkStore::memory();
+        assert!(memory.path().is_none());
+        assert!(memory.bookmarks().is_empty());
     }
 
     #[test]

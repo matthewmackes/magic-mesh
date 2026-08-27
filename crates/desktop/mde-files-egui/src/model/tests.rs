@@ -1,4 +1,5 @@
 use super::*;
+use crate::bookmarks::{self, BookmarkStore};
 use crate::dialogs::NameOperation;
 use mde_egui::search_omnibox::{ranked_hits, SearchDomain};
 use mde_files::backend::{AuditEntry, ConflictPolicy, LocalFsBackend, SendMode};
@@ -1893,6 +1894,25 @@ fn new_file_duplicate_and_links_execute_on_a_mesh_mounted_tree() {
 }
 
 #[test]
+fn duplicate_of_a_directory_uses_the_copy_suffix() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let folder = temp.path().join("Projects");
+    std::fs::create_dir(&folder).expect("mkdir");
+    std::fs::write(folder.join("readme.txt"), b"hi").expect("seed child");
+    let rows = vec![
+        FileRow::local("Projects", Mime::Folder, "\u{2014}", "\u{2014}")
+            .with_path(folder.to_string_lossy()),
+    ];
+    let mut b = live_posix_browser(rows);
+    b.click(0, 0);
+    b.duplicate_selection(0);
+    pump_until_idle(&mut b);
+    let dup = temp.path().join("Projects (copy)");
+    assert!(dup.is_dir(), "directory duplicate lands beside the source");
+    assert_eq!(std::fs::read(dup.join("readme.txt")).expect("child"), b"hi");
+}
+
+#[test]
 fn duplicate_of_an_existing_copy_name_raises_the_conflict_dialog() {
     let temp = tempfile::tempdir().expect("tempdir");
     let source = temp.path().join("report.txt");
@@ -2366,26 +2386,47 @@ fn bookmarks_pin_rename_reorder_and_refuse_hostile_input() {
     assert_eq!(b2.bookmarks().len(), 1);
     assert_eq!(b2.bookmarks()[0].label, "Documents");
 
-    let missing = load_bookmarks_at(Path::new("/no/such/files-bookmarks.json"));
-    assert!(missing
-        .expect("missing store is empty defaults")
-        .bookmarks
-        .is_empty());
+    let missing = bookmarks::load_at(Path::new("/no/such/files-bookmarks.json"));
+    assert!(missing.expect("missing store is empty defaults").is_empty());
 
     let hostile = tempfile::tempdir().expect("hostile");
     std::fs::write(hostile.path().join("files-bookmarks.json"), b"{").expect("write");
     let note =
-        load_bookmarks_at(&hostile.path().join("files-bookmarks.json")).expect_err("corrupt");
+        bookmarks::load_at(&hostile.path().join("files-bookmarks.json")).expect_err("corrupt");
     assert!(note.contains("not valid JSON") || note.contains("defaults"));
 }
 
 #[test]
 fn bookmark_validate_refuses_peer_and_escaping_paths() {
-    assert!(super::validate_bookmark_path("peer:oak").is_err());
-    assert!(super::validate_bookmark_path("/tmp/../etc/passwd").is_err());
-    assert!(super::validate_bookmark_path("relative").is_err());
-    assert!(super::validate_bookmark_path("/home/me/docs").is_ok());
-    assert!(super::validate_bookmark_path("local:home").is_ok());
+    assert!(bookmarks::validate_path("peer:oak").is_err());
+    assert!(bookmarks::validate_path("/tmp/../etc/passwd").is_err());
+    assert!(bookmarks::validate_path("relative").is_err());
+    assert!(bookmarks::validate_path("/home/me/docs").is_ok());
+    assert!(bookmarks::validate_path("local:home").is_ok());
+}
+
+#[test]
+fn bookmark_rename_flushes_through_the_dedicated_store() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let folder = temp.path().join("Projects");
+    std::fs::create_dir(&folder).expect("mkdir");
+    let store = tempfile::tempdir().expect("bookmark store");
+    let rows = vec![
+        FileRow::local("Projects", Mime::Folder, "\u{2014}", "\u{2014}")
+            .with_path(folder.to_string_lossy()),
+    ];
+    let mut b = live_posix_browser(rows).with_config_dir(store.path());
+    b.click(0, 0);
+    b.pin_focused(0);
+    b.flush_persisted();
+    b.open_rename_bookmark(0);
+    b.set_name_dialog_input("Documents".to_string());
+    b.submit_name_dialog(0);
+    assert!(b.name_dialog().is_none(), "rename closed after submit");
+    let persisted = BookmarkStore::open(store.path());
+    assert_eq!(persisted.bookmarks().len(), 1);
+    assert_eq!(persisted.bookmarks()[0].label, "Documents");
+    assert_eq!(persisted.bookmarks()[0].path, folder.to_string_lossy());
 }
 
 // WL-FUNC-027 — add/remove/reorder round-trip: every mutation on the user
@@ -2460,7 +2501,7 @@ fn bookmarks_add_remove_and_reorder_all_survive_restart() {
 // WL-FUNC-027 — a symlink at the bookmarks store path is a classic
 // preferences-hijack attack: the attacker leaves a symlink pointing at a
 // sensitive file so the surface either reads it as JSON or overwrites it on
-// the next flush. `load_bookmarks_at` must refuse the symlink outright, the
+// the next flush. `bookmarks::load_at` must refuse the symlink outright, the
 // hydrating browser must degrade to empty defaults with an operator-visible
 // note, and the target file bytes must survive untouched.
 #[test]
@@ -2468,20 +2509,20 @@ fn bookmarks_reject_a_symlinked_store_and_leave_target_intact() {
     let dir = tempfile::tempdir().expect("store dir");
     let target = dir.path().join("outside.json");
     std::fs::write(&target, b"secret sibling bytes").expect("seed target");
-    let store = dir.path().join(super::BOOKMARKS_FILE);
+    let store = dir.path().join(bookmarks::BOOKMARKS_FILE);
     std::os::unix::fs::symlink(&target, &store).expect("symlink store");
 
-    let note = super::load_bookmarks_at(&store).expect_err("symlinked store refuses");
+    let note = bookmarks::load_at(&store).expect_err("symlinked store refuses");
     assert!(
-        note.contains("symlink") || note.contains("defaults"),
-        "honest refusal: {note}"
+        note.contains("symlink") && note.contains("bookmarks"),
+        "honest refusal names the bookmarks store: {note}"
     );
 
     let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
     assert!(b.bookmarks().is_empty());
     assert!(
         b.last_note()
-            .is_some_and(|n| n.contains("symlink") || n.contains("defaults")),
+            .is_some_and(|n| n.contains("symlink") && n.contains("bookmarks")),
         "operator-visible note: {:?}",
         b.last_note()
     );
@@ -2508,7 +2549,7 @@ fn bookmarks_reject_a_symlinked_store_and_leave_target_intact() {
 #[test]
 fn bookmarks_corrupt_store_is_preserved_until_the_operator_mutates() {
     let dir = tempfile::tempdir().expect("store dir");
-    let store = dir.path().join(super::BOOKMARKS_FILE);
+    let store = dir.path().join(bookmarks::BOOKMARKS_FILE);
     let corrupt = br#"{"bookmarks": [not valid json"#;
     std::fs::write(&store, corrupt).expect("seed corrupt");
 
@@ -2543,9 +2584,9 @@ fn bookmarks_corrupt_store_is_preserved_until_the_operator_mutates() {
     b2.flush_persisted();
     drop(b2);
 
-    let reloaded = super::load_bookmarks_at(&store).expect("valid after mutation");
-    assert_eq!(reloaded.bookmarks.len(), 1);
-    assert_eq!(reloaded.bookmarks[0].path, target.to_string_lossy());
+    let reloaded = bookmarks::load_at(&store).expect("valid after mutation");
+    assert_eq!(reloaded.len(), 1);
+    assert_eq!(reloaded[0].path, target.to_string_lossy());
 }
 
 // WL-FUNC-027 — a failed bookmark write must be visible instead of making a
@@ -2572,16 +2613,16 @@ fn bookmarks_report_persistence_failure_and_keep_dirty_state() {
         b.last_note()
     );
     assert!(
-        !blocked_parent.join(super::BOOKMARKS_FILE).exists(),
+        !blocked_parent.join(bookmarks::BOOKMARKS_FILE).exists(),
         "a failed write must not claim to have created the store"
     );
 
     std::fs::remove_file(&blocked_parent).expect("remove blocker");
     std::fs::create_dir(&blocked_parent).expect("repair config parent");
     b.flush_persisted();
-    let saved = super::load_bookmarks_at(&blocked_parent.join(super::BOOKMARKS_FILE))
+    let saved = bookmarks::load_at(&blocked_parent.join(bookmarks::BOOKMARKS_FILE))
         .expect("retry should persist after repair");
-    assert_eq!(saved.bookmarks, b.bookmarks());
+    assert_eq!(saved.as_slice(), b.bookmarks());
 }
 
 // WL-FUNC-027 — a parseable store can still be hostile: over the count cap,
@@ -2593,7 +2634,7 @@ fn bookmarks_report_persistence_failure_and_keep_dirty_state() {
 #[test]
 fn bookmarks_hydrate_caps_hostile_entries_and_refuses_the_next_pin() {
     let dir = tempfile::tempdir().expect("store dir");
-    let store = dir.path().join(super::BOOKMARKS_FILE);
+    let store = dir.path().join(bookmarks::BOOKMARKS_FILE);
 
     let mut entries = Vec::new();
     entries.push(serde_json::json!({"label": "keep-0", "path": "/tmp/mcnf-bm-0"}));
@@ -2605,10 +2646,10 @@ fn bookmarks_hydrate_caps_hostile_entries_and_refuses_the_next_pin() {
     entries.push(serde_json::json!({"label": "dup", "path": "/tmp/mcnf-bm-0"}));
     entries.push(serde_json::json!({"label": "", "path": "/tmp/mcnf-bm-empty"}));
     entries.push(serde_json::json!({
-        "label": "X".repeat(super::BOOKMARK_LABEL_MAX + 16),
+        "label": "X".repeat(bookmarks::LABEL_MAX + 16),
         "path": "/tmp/mcnf-bm-long"
     }));
-    for i in 1..super::BOOKMARKS_CAP {
+    for i in 1..bookmarks::CAP {
         entries.push(serde_json::json!({
             "label": format!("keep-{i}"),
             "path": format!("/tmp/mcnf-bm-{i}")
@@ -2624,7 +2665,7 @@ fn bookmarks_hydrate_caps_hostile_entries_and_refuses_the_next_pin() {
     let raw_before = std::fs::read(&store).expect("seed bytes");
 
     let b = live_posix_browser(Vec::new()).with_config_dir(dir.path());
-    assert_eq!(b.bookmarks().len(), super::BOOKMARKS_CAP);
+    assert_eq!(b.bookmarks().len(), bookmarks::CAP);
     assert_eq!(b.bookmarks()[0].path, "/tmp/mcnf-bm-0");
     assert!(
         b.bookmarks()
@@ -2637,7 +2678,7 @@ fn bookmarks_hydrate_caps_hostile_entries_and_refuses_the_next_pin() {
         .iter()
         .find(|bm| bm.path == "/tmp/mcnf-bm-long")
         .expect("long label kept");
-    assert_eq!(long.label.chars().count(), super::BOOKMARK_LABEL_MAX);
+    assert_eq!(long.label.chars().count(), bookmarks::LABEL_MAX);
     assert!(b.bookmarks().iter().all(|bm| {
         bm.path != "peer:oak"
             && bm.path != "/tmp/../etc/passwd"
@@ -2676,25 +2717,25 @@ fn bookmarks_hydrate_caps_hostile_entries_and_refuses_the_next_pin() {
     let mut b2 = live_posix_browser(rows).with_config_dir(dir.path());
     b2.click(0, 0);
     b2.pin_focused(0);
-    assert_eq!(b2.bookmarks().len(), super::BOOKMARKS_CAP);
+    assert_eq!(b2.bookmarks().len(), bookmarks::CAP);
     assert!(
         b2.last_note()
-            .is_some_and(|n| n.contains("At most") && n.contains(&super::BOOKMARKS_CAP.to_string())),
+            .is_some_and(|n| n.contains("At most") && n.contains(&bookmarks::CAP.to_string())),
         "pin past cap: {:?}",
         b2.last_note()
     );
 
     let oversize = tempfile::tempdir().expect("oversize");
     std::fs::write(
-        oversize.path().join(super::BOOKMARKS_FILE),
-        vec![b'x'; (super::BOOKMARKS_MAX_BYTES as usize) + 8],
+        oversize.path().join(bookmarks::BOOKMARKS_FILE),
+        vec![b'x'; (bookmarks::MAX_BYTES as usize) + 8],
     )
     .expect("write");
-    let err = super::load_bookmarks_at(&oversize.path().join(super::BOOKMARKS_FILE))
-        .expect_err("oversize");
+    let err =
+        bookmarks::load_at(&oversize.path().join(bookmarks::BOOKMARKS_FILE)).expect_err("oversize");
     assert!(err.contains("larger than"), "oversize note: {err}");
 
-    assert!(super::validate_bookmark_path("local:..").is_err());
-    assert!(super::validate_bookmark_path("/tmp/./secret").is_err());
-    assert!(super::validate_bookmark_path("local:home\n").is_err());
+    assert!(bookmarks::validate_path("local:..").is_err());
+    assert!(bookmarks::validate_path("/tmp/./secret").is_err());
+    assert!(bookmarks::validate_path("local:home\n").is_err());
 }

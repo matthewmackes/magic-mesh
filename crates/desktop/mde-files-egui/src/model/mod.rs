@@ -37,6 +37,8 @@ use mde_files::send_to::{SendToEntry, SendToRequest};
 use mde_files::ArchiveFormat;
 use serde::{Deserialize, Serialize};
 
+use crate::bookmarks::BookmarkStore;
+pub use crate::bookmarks::UserBookmark;
 use crate::chat_bridge::{BusChatBridge, ChatBridge};
 use crate::dialogs::{
     Arming, ConfirmDelete, ExtractToDialog, NameDialog, NameOperation, Perm, PermClass,
@@ -56,15 +58,12 @@ use mde_files::opqueue::{ConflictChoice, Resolution};
 /// Matches the other Bus surfaces' cadence.
 const MOUNT_POLL: Duration = Duration::from_secs(2); // logic-timing, not motion (poll interval)
 const HOME_SEARCH_LIMIT: usize = 32;
-/// Debounce window for folder-prefs / bookmark writes (logic-timing, not motion).
+/// Debounce window for folder-prefs writes (logic-timing, not motion).
+/// Bookmarks flush immediately through [`BookmarkStore`].
 const PREFS_DEBOUNCE: Duration = Duration::from_millis(400);
 const FOLDER_PREFS_CAP: usize = 256;
 const FOLDER_PREFS_MAX_BYTES: u64 = 256 * 1024;
-const BOOKMARKS_CAP: usize = 48;
-const BOOKMARKS_MAX_BYTES: u64 = 64 * 1024;
-const BOOKMARK_LABEL_MAX: usize = 128;
 const FOLDER_PREFS_FILE: &str = "files-folder-prefs.json";
-const BOOKMARKS_FILE: &str = "files-bookmarks.json";
 
 /// The short mount hostname for a peer — the `<host>` verb slot.
 ///
@@ -416,16 +415,6 @@ fn resolve_local_pref_path(rest: &str) -> Option<String> {
     Some(resolved.to_string_lossy().into_owned())
 }
 
-/// A user-pinnable Places bookmark (lock 21). Path is a local backend route
-/// (absolute `/…` or a `local:` slug); mesh peers stay a live roster section.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct UserBookmark {
-    /// Sidebar label.
-    pub label: String,
-    /// Backend `list()` path the bookmark navigates to.
-    pub path: String,
-}
-
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct FolderPrefsFile {
     #[serde(default)]
@@ -436,12 +425,6 @@ pub(crate) struct FolderPrefsFile {
 pub(crate) struct FolderPrefsStored {
     path: String,
     prefs: FolderPrefs,
-}
-
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub(crate) struct BookmarksFile {
-    #[serde(default)]
-    pub(crate) bookmarks: Vec<UserBookmark>,
 }
 
 /// Outcome of the most recent Send-To, surfaced in the status line.
@@ -1164,9 +1147,7 @@ pub struct FileBrowser {
     folder_prefs_lru: VecDeque<String>,
     folder_prefs_path: Option<PathBuf>,
     folder_prefs_dirty: Option<Instant>,
-    bookmarks: Vec<UserBookmark>,
-    bookmarks_path: Option<PathBuf>,
-    bookmarks_dirty: Option<Instant>,
+    bookmark_store: BookmarkStore,
     destination: Option<String>,
     last_send: SendOutcome,
     last_note: Option<String>,
@@ -1253,9 +1234,7 @@ impl FileBrowser {
             folder_prefs_lru: VecDeque::new(),
             folder_prefs_path: default_config_file(FOLDER_PREFS_FILE),
             folder_prefs_dirty: None,
-            bookmarks: Vec::new(),
-            bookmarks_path: default_config_file(BOOKMARKS_FILE),
-            bookmarks_dirty: None,
+            bookmark_store: initial_bookmark_store(),
             destination: None,
             last_send: SendOutcome::Idle,
             last_note: None,
@@ -1270,7 +1249,7 @@ impl FileBrowser {
             new_transfer: None,
         };
         me.hydrate_folder_prefs();
-        me.hydrate_bookmarks();
+        me.sync_bookmark_note();
         me.refresh_roster();
         me.reload(0);
         me.reload(1);
@@ -1331,9 +1310,9 @@ impl FileBrowser {
     pub fn with_config_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         let dir = dir.into();
         self.folder_prefs_path = Some(dir.join(FOLDER_PREFS_FILE));
-        self.bookmarks_path = Some(dir.join(BOOKMARKS_FILE));
+        self.bookmark_store = BookmarkStore::open(&dir);
         self.hydrate_folder_prefs();
-        self.hydrate_bookmarks();
+        self.sync_bookmark_note();
         self.reload(0);
         self.reload(1);
         self
@@ -3614,7 +3593,7 @@ impl FileBrowser {
     /// User Places bookmarks, in display order (above the fixed Places set).
     #[must_use]
     pub fn bookmarks(&self) -> &[UserBookmark] {
-        &self.bookmarks
+        self.bookmark_store.bookmarks()
     }
 
     /// Pin the focused row (a directory, or a file's parent) into Places.
@@ -3639,47 +3618,27 @@ impl FileBrowser {
             self.last_note = Some("Select a folder to pin.".to_string());
             return;
         };
-        let route = bookmark_route(&path);
-        if let Err(note) = validate_bookmark_path(&route) {
-            self.last_note = Some(note);
-            return;
+        let route = path.to_string_lossy().into_owned();
+        match self.bookmark_store.pin(route) {
+            Ok(()) => self.last_note = None,
+            Err(note) => self.last_note = Some(note),
         }
-        if self.bookmarks.iter().any(|b| b.path == route) {
-            self.last_note = Some("That location is already pinned.".to_string());
-            return;
-        }
-        if self.bookmarks.len() >= BOOKMARKS_CAP {
-            self.last_note = Some(format!("At most {BOOKMARKS_CAP} bookmarks can be pinned."));
-            return;
-        }
-        let label = sanitize_bookmark_label(&bookmark_label(&route), &route);
-        self.bookmarks.push(UserBookmark { label, path: route });
-        self.bookmarks_dirty = Some(Instant::now());
-        self.last_note = None;
     }
 
     /// Remove the bookmark at `index`.
     pub fn unpin_bookmark(&mut self, index: usize) {
-        if index < self.bookmarks.len() {
-            self.bookmarks.remove(index);
-            self.bookmarks_dirty = Some(Instant::now());
-            self.last_note = None;
-        }
+        self.bookmark_store.unpin(index);
+        self.last_note = None;
     }
 
     /// Move bookmark `index` by `delta` (-1 up, +1 down).
     pub fn reorder_bookmark(&mut self, index: usize, delta: i32) {
-        let dest = index as i32 + delta;
-        if dest < 0 || dest as usize >= self.bookmarks.len() || index >= self.bookmarks.len() {
-            return;
-        }
-        self.bookmarks.swap(index, dest as usize);
-        self.bookmarks_dirty = Some(Instant::now());
+        self.bookmark_store.reorder(index, delta);
     }
 
     /// Open Rename Bookmark for `index`.
     pub fn open_rename_bookmark(&mut self, index: usize) {
-        let Some(bookmark) = self.bookmarks.get(index) else {
+        let Some(bookmark) = self.bookmark_store.bookmarks().get(index) else {
             self.last_note = Some("No such bookmark.".to_string());
             return;
         };
@@ -3698,19 +3657,19 @@ impl FileBrowser {
             return;
         }
         let name = dialog.name.trim().to_string();
-        if name.len() > BOOKMARK_LABEL_MAX {
-            if let Some(dialog) = self.name_dialog.as_mut() {
-                dialog.error = Some(format!(
-                    "Name is longer than {BOOKMARK_LABEL_MAX} characters."
-                ));
+        match self.bookmark_store.rename(index, &name) {
+            Ok(()) => {
+                self.name_dialog = None;
+                self.last_note = None;
+                if !self.bookmark_store.flush() {
+                    self.sync_bookmark_note();
+                }
             }
-            return;
-        }
-        if let Some(bookmark) = self.bookmarks.get_mut(index) {
-            bookmark.label = name;
-            self.bookmarks_dirty = Some(Instant::now());
-            self.name_dialog = None;
-            self.last_note = None;
+            Err(note) => {
+                if let Some(dialog) = self.name_dialog.as_mut() {
+                    dialog.error = Some(note);
+                }
+            }
         }
     }
 
@@ -3719,8 +3678,8 @@ impl FileBrowser {
         if self.folder_prefs_dirty.is_some() && self.write_folder_prefs() {
             self.folder_prefs_dirty = None;
         }
-        if self.bookmarks_dirty.is_some() && self.write_bookmarks() {
-            self.bookmarks_dirty = None;
+        if !self.bookmark_store.flush() {
+            self.sync_bookmark_note();
         }
     }
 
@@ -3731,10 +3690,10 @@ impl FileBrowser {
                 self.folder_prefs_dirty = None;
             }
         }
-        if self.bookmarks_dirty.is_some_and(due) {
-            if self.write_bookmarks() {
-                self.bookmarks_dirty = None;
-            }
+        // Bookmarks skip the prefs debounce: pin/rename/reorder must land on
+        // disk by the next pump so a restart keeps the Places user section.
+        if !self.bookmark_store.flush() {
+            self.sync_bookmark_note();
         }
     }
 
@@ -3778,52 +3737,9 @@ impl FileBrowser {
         }
     }
 
-    fn hydrate_bookmarks(&mut self) {
-        let Some(path) = self.bookmarks_path.clone() else {
-            return;
-        };
-        match load_bookmarks_at(&path) {
-            Ok(file) => {
-                let mut kept = Vec::new();
-                let mut dropped = 0usize;
-                let mut repaired = 0usize;
-                for raw in file.bookmarks {
-                    if validate_bookmark_path(&raw.path).is_err()
-                        || kept.iter().any(|b: &UserBookmark| b.path == raw.path)
-                    {
-                        dropped += 1;
-                        continue;
-                    }
-                    if kept.len() >= BOOKMARKS_CAP {
-                        dropped += 1;
-                        continue;
-                    }
-                    let label = sanitize_bookmark_label(&raw.label, &raw.path);
-                    if label != raw.label {
-                        repaired += 1;
-                    }
-                    kept.push(UserBookmark {
-                        label,
-                        path: raw.path,
-                    });
-                }
-                self.bookmarks = kept;
-                // In-memory only: a parseable-but-hostile store is not rewritten
-                // until the operator mutates (same rule as a corrupt file).
-                if dropped > 0 {
-                    self.last_note = Some(format!(
-                        "Dropped {dropped} hostile or over-cap bookmark(s) — using the first {BOOKMARKS_CAP} valid unique pins."
-                    ));
-                } else if repaired > 0 {
-                    self.last_note = Some(format!(
-                        "Repaired {repaired} bookmark label(s) from a hostile store."
-                    ));
-                }
-            }
-            Err(note) => {
-                self.bookmarks.clear();
-                self.last_note = Some(note);
-            }
+    fn sync_bookmark_note(&mut self) {
+        if let Some(note) = self.bookmark_store.last_note() {
+            self.last_note = Some(note.to_string());
         }
     }
 
@@ -3846,27 +3762,6 @@ impl FileBrowser {
             Err(error) => {
                 self.last_note = Some(format!(
                     "Folder preferences could not be saved to {}: {error}",
-                    path.display()
-                ));
-                false
-            }
-        }
-    }
-
-    fn write_bookmarks(&mut self) -> bool {
-        let Some(path) = self.bookmarks_path.clone() else {
-            return true;
-        };
-        match write_json_store(
-            &path,
-            &BookmarksFile {
-                bookmarks: self.bookmarks.clone(),
-            },
-        ) {
-            Ok(()) => true,
-            Err(error) => {
-                self.last_note = Some(format!(
-                    "Bookmarks could not be saved to {}: {error}",
                     path.display()
                 ));
                 false
@@ -3927,6 +3822,16 @@ fn default_config_file(name: &str) -> Option<PathBuf> {
 #[cfg(test)]
 fn default_config_file(_name: &str) -> Option<PathBuf> {
     None
+}
+
+#[cfg(test)]
+fn initial_bookmark_store() -> BookmarkStore {
+    BookmarkStore::memory()
+}
+
+#[cfg(not(test))]
+fn initial_bookmark_store() -> BookmarkStore {
+    BookmarkStore::from_env()
 }
 
 fn archive_file_stem(path: &Path) -> String {
@@ -3996,94 +3901,10 @@ fn symlink_escapes_mesh(parent: &Path, link: &Path, target: &Path) -> bool {
     !normalize_path(&resolved).starts_with(&root)
 }
 
-fn bookmark_route(path: &Path) -> String {
-    path.to_string_lossy().into_owned()
-}
-
-fn bookmark_label(route: &str) -> String {
-    if let Some(slug) = route.strip_prefix("local:") {
-        return slug.to_string();
-    }
-    Path::new(route)
-        .file_name()
-        .and_then(|s| s.to_str())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(route)
-        .to_string()
-}
-
-fn sanitize_bookmark_label(label: &str, route: &str) -> String {
-    let cleaned: String = label.chars().filter(|c| !c.is_control()).collect();
-    let trimmed = cleaned.trim();
-    let base = if trimmed.is_empty() {
-        let fallback: String = bookmark_label(route)
-            .chars()
-            .filter(|c| !c.is_control())
-            .collect();
-        let fallback = fallback.trim().to_string();
-        if fallback.is_empty() {
-            route.to_string()
-        } else {
-            fallback
-        }
-    } else {
-        trimmed.to_string()
-    };
-    if base.chars().count() > BOOKMARK_LABEL_MAX {
-        base.chars().take(BOOKMARK_LABEL_MAX).collect()
-    } else {
-        base
-    }
-}
-
-fn validate_bookmark_path(path: &str) -> Result<(), String> {
-    if path.is_empty() {
-        return Err("A bookmark needs a path.".to_string());
-    }
-    if path.chars().any(|c| c.is_control()) {
-        return Err("A bookmark path can't contain a control character.".to_string());
-    }
-    if path.starts_with("peer:") {
-        return Err(
-            "Mesh peers stay in the Mesh section — pin a local folder instead.".to_string(),
-        );
-    }
-    if let Some(slug) = path.strip_prefix("local:") {
-        if slug.is_empty()
-            || slug != slug.trim()
-            || slug.contains('/')
-            || slug.contains('\\')
-            || matches!(slug, "." | "..")
-        {
-            return Err("That local place isn't a valid bookmark.".to_string());
-        }
-        return Ok(());
-    }
-    let p = Path::new(path);
-    if !p.is_absolute() {
-        return Err("Pin an absolute folder path.".to_string());
-    }
-    // `Path::components()` drops interior `.`, so a hostile `/tmp/./secret`
-    // would otherwise hydrate as a normal pin. Inspect the raw segments.
-    if path.split('/').any(|seg| matches!(seg, "." | "..")) {
-        return Err("A bookmark path can't contain '.' or '..' components.".to_string());
-    }
-    Ok(())
-}
-
 /// Load folder prefs from `path`, degrading hostile files to an error string.
 pub(crate) fn load_folder_prefs_at(path: &Path) -> Result<FolderPrefsFile, String> {
     match read_json_store::<FolderPrefsFile>(path, FOLDER_PREFS_MAX_BYTES) {
         Ok(None) => Ok(FolderPrefsFile::default()),
-        Ok(Some(file)) => Ok(file),
-        Err(note) => Err(note),
-    }
-}
-
-/// Load bookmarks from `path`, degrading hostile files to an error string.
-pub(crate) fn load_bookmarks_at(path: &Path) -> Result<BookmarksFile, String> {
-    match read_json_store::<BookmarksFile>(path, BOOKMARKS_MAX_BYTES) {
-        Ok(None) => Ok(BookmarksFile::default()),
         Ok(Some(file)) => Ok(file),
         Err(note) => Err(note),
     }

@@ -674,6 +674,15 @@ impl CollabSession {
         self
     }
 
+    /// Join (or host) with an explicit [`Access`]. A view-only guest refuses
+    /// local edits immediately, before the host has granted; the host can later
+    /// promote them to [`Access::ReadWrite`] over the wire.
+    #[must_use]
+    pub const fn with_access(mut self, access: Access) -> Self {
+        self.access = access;
+        self
+    }
+
     /// This peer's identity.
     #[must_use]
     pub fn me(&self) -> &str {
@@ -1508,6 +1517,36 @@ mod tests {
             "guests hold no authority"
         );
         assert_eq!(guest.role(), Role::Guest);
+    }
+
+    #[test]
+    fn guest_can_join_view_only_and_refuse_edits_before_a_host_grant() {
+        let bus = FakeBus::new();
+        let mut host = CollabSession::host(sid("ro"), "host", "doc\n");
+        let mut guest = CollabSession::guest(sid("ro"), "guest").with_access(Access::ReadOnly);
+        guest.join(&bus);
+        host.poll(&bus);
+        guest.poll(&bus);
+        assert_eq!(guest.access(), Access::ReadOnly);
+        assert!(
+            !guest.local_insert(0, "nope"),
+            "view-only join refuses edits before a host grant"
+        );
+        guest.flush(&bus);
+        let host_out = host.poll(&bus);
+        assert!(
+            host_out.edits.is_empty(),
+            "no edit crossed from a view-only guest"
+        );
+        assert_eq!(host.doc().to_text(), "doc\n");
+
+        assert!(host.grant("guest", Access::ReadWrite, &bus));
+        guest.poll(&bus);
+        assert!(guest.can_edit(), "host grant restores editing");
+        assert!(guest.local_insert(0, "ok "));
+        guest.flush(&bus);
+        host.poll(&bus);
+        assert_eq!(host.doc().to_text(), "ok doc\n");
     }
 
     // ── honesty ──

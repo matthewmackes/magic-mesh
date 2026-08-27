@@ -190,7 +190,8 @@ impl FixtureData {
 
     /// One space, one live document session row, and a resolved Markdown body.
     /// Two-seat share/join/follow/close tests build both seats from this so
-    /// membership and the picker row are real, never faked.
+    /// membership and the picker row are real, never faked. View/edit permission
+    /// is not a projection field — the live collab session Access is the authority.
     #[must_use]
     pub fn document_share(
         me: &str,
@@ -199,12 +200,26 @@ impl FixtureData {
         participants: &[&str],
         body: &str,
     ) -> Self {
+        Self::document_share_with_role(me, space, document, participants, body, SpaceRole::Member)
+    }
+
+    /// Same as [`Self::document_share`] with an explicit directory role so
+    /// owner-vs-member share/join tests do not invent a second fixture shape.
+    #[must_use]
+    pub fn document_share_with_role(
+        me: &str,
+        space: SpaceId,
+        document: DocumentId,
+        participants: &[&str],
+        body: &str,
+        role: SpaceRole,
+    ) -> Self {
         Self::new(me, 1_000)
             .with_space(space_summary(
                 space,
                 SpaceKind::Project,
                 "Docs",
-                SpaceRole::Member,
+                role,
                 0,
                 participants.len() as u32,
                 1_000,
@@ -580,6 +595,37 @@ mod tests {
             None,
         )
         .expect("valid device-absent session")
+    }
+
+    #[test]
+    fn document_share_with_role_records_the_directory_role() {
+        use mde_collab_types::{DocumentId, SpaceId, SpaceRole};
+
+        let space = SpaceId::new();
+        let document = DocumentId::new();
+        let owner = FixtureData::document_share_with_role(
+            "eagle",
+            space,
+            document,
+            &["eagle", "falcon"],
+            "# Runbook\n",
+            SpaceRole::Owner,
+        );
+        assert_eq!(owner.space_directory().spaces[0].role, SpaceRole::Owner);
+        assert_eq!(
+            FixtureData::document_share(
+                "falcon",
+                space,
+                document,
+                &["eagle", "falcon"],
+                "# Runbook\n"
+            )
+            .space_directory()
+            .spaces[0]
+                .role,
+            SpaceRole::Member,
+            "the default share fixture stays a member row"
+        );
     }
 
     #[test]

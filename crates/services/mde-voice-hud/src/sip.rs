@@ -381,6 +381,115 @@ pub fn plan_pstn_agent(accounts: Option<VoiceAccounts>) -> PstnAgentDrive {
     }
 }
 
+/// WL-FUNC-024 S6 — closed failure class for a PSTN leg that dropped.
+///
+/// Tokens match the collab-types MediaFailureReasonV1 wire names. This crate
+/// stays the SIP core and does not take a collab-types dependency.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PstnFailureClass {
+    /// No governed SIP/PSTN provider or transport.
+    TransportUnavailable,
+    /// The remote party left (BYE) or stopped answering.
+    PeerDropped,
+    /// A previously bound capture/playback device was unplugged mid-call.
+    DeviceUnplugged,
+    /// Capture/playback permission was revoked after the dialog started.
+    PermissionRevoked,
+}
+
+impl PstnFailureClass {
+    /// Canonical snake-case token.
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::TransportUnavailable => "transport_unavailable",
+            Self::PeerDropped => "peer_dropped",
+            Self::DeviceUnplugged => "device_unplugged",
+            Self::PermissionRevoked => "permission_revoked",
+        }
+    }
+}
+
+/// Bounded PSTN recovery after a live-leg drop (WL-FUNC-024 S6).
+///
+/// Auto-reconnect and manual re-dial are mutually exclusive. This document
+/// never claims a connected PSTN dialog.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PstnRecovery {
+    /// Why the live leg dropped.
+    pub class: PstnFailureClass,
+    /// One-based attempt count, bounded by [`MAX_PSTN_RECONNECT_ATTEMPTS`].
+    pub attempt: u16,
+    /// `true` while the agent is still auto-reconnecting.
+    pub auto_reconnect: bool,
+    /// `true` when auto-reconnect is exhausted and a manual redial is offered.
+    pub redial_offered: bool,
+}
+
+/// Same bound as collab-types `MAX_MEDIA_RECONNECT_ATTEMPTS`.
+pub const MAX_PSTN_RECONNECT_ATTEMPTS: u16 = 16;
+
+impl PstnRecovery {
+    /// Recovery is never live PSTN media.
+    #[must_use]
+    pub const fn claims_live_pstn(&self) -> bool {
+        let _ = self;
+        false
+    }
+
+    /// Manual redial is offered only after auto-reconnect is exhausted on a
+    /// driveable provider.
+    #[must_use]
+    pub const fn offers_redial(&self) -> bool {
+        self.redial_offered && !self.auto_reconnect
+    }
+}
+
+/// Plan recovery after a PSTN live-leg drop.
+///
+/// - An absent / un-driveable provider never auto-reconnects and never offers
+///   redial (there is nothing to redial to).
+/// - A Ready provider auto-reconnects for attempts `1..=MAX`, then offers
+///   redial once the bound is exhausted.
+/// - Attempt `0` is not a recovery cycle: fail closed with no auto-reconnect
+///   and no redial.
+#[must_use]
+pub fn plan_pstn_recovery(
+    drive: &PstnAgentDrive,
+    class: PstnFailureClass,
+    attempt: u16,
+) -> PstnRecovery {
+    match drive {
+        PstnAgentDrive::Unavailable { .. } => PstnRecovery {
+            class: PstnFailureClass::TransportUnavailable,
+            attempt: attempt.max(1).min(MAX_PSTN_RECONNECT_ATTEMPTS),
+            auto_reconnect: false,
+            redial_offered: false,
+        },
+        PstnAgentDrive::Ready { .. } => {
+            if attempt == 0 || attempt > MAX_PSTN_RECONNECT_ATTEMPTS {
+                PstnRecovery {
+                    class,
+                    attempt: if attempt == 0 {
+                        1
+                    } else {
+                        MAX_PSTN_RECONNECT_ATTEMPTS
+                    },
+                    auto_reconnect: false,
+                    redial_offered: attempt > MAX_PSTN_RECONNECT_ATTEMPTS,
+                }
+            } else {
+                PstnRecovery {
+                    class,
+                    attempt,
+                    auto_reconnect: true,
+                    redial_offered: false,
+                }
+            }
+        }
+    }
+}
+
 /// From URI presented on an ExternalTrunk INVITE.
 ///
 /// The shared-outbound caller-ID is the fleet number the callee must see.
@@ -3256,6 +3365,54 @@ mod tests {
             other => panic!("absent provider must emit Failed, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "no extra registration events");
+    }
+
+    #[test]
+    fn pstn_recovery_auto_reconnects_then_offers_redial_and_never_claims_live() {
+        let absent = plan_pstn_agent(None);
+        let absent_recovery = plan_pstn_recovery(&absent, PstnFailureClass::PeerDropped, 1);
+        assert_eq!(
+            absent_recovery.class,
+            PstnFailureClass::TransportUnavailable
+        );
+        assert!(!absent_recovery.auto_reconnect);
+        assert!(!absent_recovery.offers_redial());
+        assert!(!absent_recovery.claims_live_pstn());
+
+        let ready = plan_pstn_agent(Some(
+            SipAccount::accounts_from_toml(
+                "username = \"15551234567\"\npassword = \"pw\"\nserver = \"sip.vitelity.net\"\n",
+            )
+            .unwrap(),
+        ));
+        let auto = plan_pstn_recovery(&ready, PstnFailureClass::PeerDropped, 1);
+        assert_eq!(auto.class, PstnFailureClass::PeerDropped);
+        assert_eq!(auto.class.as_str(), "peer_dropped");
+        assert!(auto.auto_reconnect);
+        assert!(!auto.offers_redial());
+        assert!(!auto.claims_live_pstn());
+        assert!(!ready.claims_live_pstn());
+
+        let last_auto = plan_pstn_recovery(
+            &ready,
+            PstnFailureClass::DeviceUnplugged,
+            MAX_PSTN_RECONNECT_ATTEMPTS,
+        );
+        assert!(last_auto.auto_reconnect);
+        assert!(!last_auto.offers_redial());
+
+        let redial = plan_pstn_recovery(
+            &ready,
+            PstnFailureClass::PermissionRevoked,
+            MAX_PSTN_RECONNECT_ATTEMPTS + 1,
+        );
+        assert!(!redial.auto_reconnect);
+        assert!(redial.offers_redial());
+        assert!(!redial.claims_live_pstn());
+
+        let zero = plan_pstn_recovery(&ready, PstnFailureClass::PeerDropped, 0);
+        assert!(!zero.auto_reconnect);
+        assert!(!zero.offers_redial());
     }
 
     #[test]
