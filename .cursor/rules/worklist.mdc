@@ -52,8 +52,8 @@ reconciler already owns.
 
 When cargo is fresh at this HEAD, the next act is
 `automation/drain/leftover-units.sh runnable` over `@leftover:{…}`
-markers (`live-seat`, `source`, `dest-operator`, `keep`,
-`release-wait`). Do not invent dests. Do not treat dest-operator or
+markers (`source` now; `live-seat` only after `WL-TEST-003` is Remaining
+following a testing Beta). Do not invent dests. Do not treat dest-operator or
 keep leftovers as farm-idle.
 
 `Status: Blocked` and `Status: Needs clarification` epics may omit the

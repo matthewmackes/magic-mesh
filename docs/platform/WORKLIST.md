@@ -7,14 +7,13 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **18 active epics:** 18 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
-  Operator 2026-08-23 authorized lifting the release chain that the
-  2026-08-22 survey had kept Blocked. Leftovers: dest-cut `bc14a22d7` on
-  Seat 15/Dell/Surface and LH1–LH3; dest-gated arming/Browser VM/collab SHA
-  remain. REL-006 admission, then official cut/sign/publish. Do not invent
-  a mesh-id or bearer. Do not flip `production_admitted`. Do not publish
-  or freeze while those leftovers are open. Unpublished `13.0.0-35` /
-  lighthouse `13.0.0-11` (`bc14a22d7`) is installed on the dest-cut set.
+- **19 active epics:** 18 `Remaining`, 1 `Blocked`, 0 `Needs clarification`.
+  Operator 2026-08-27 moved all live-seat, release-wait, and operator-testing
+  leftovers to `WL-TEST-003` (`Blocked` until a testing Beta is released).
+  Dest-cut `bc14a22d7` is not that Beta. REL dest-operator admission stays on
+  Remaining REL epics. Do not invent a mesh-id or bearer. Do not flip
+  `production_admitted`. Unpublished `13.0.0-35` / lighthouse `13.0.0-11`
+  (`bc14a22d7`) remains installed on the dest-cut set.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -22,9 +21,10 @@ tasks.
   inputs under `WL-REL-006` against that exact candidate; reconfirm that the
   candidate did not move and promote the same revision to the final source
   freeze; cut and sign the six roles under `WL-REL-002`/`WL-REL-003`; stage
-  the unpublished signed candidate on the production topology and run
-  `WL-TEST-002`; complete the final signed evidence envelope under
-  `WL-REL-004`; then publish and read back under `WL-REL-005`. If source changes
+  and release a testing Beta; then execute live-seat and operator testing
+  under `WL-TEST-003`. Farm fixture gates stay on `WL-TEST-002`. Complete the
+  final signed evidence envelope under `WL-REL-004`; then publish and read
+  back under `WL-REL-005`. If source changes
   after input generation begins, invalidate the source-bound receipts and
   repeat input   admission; never solve the dependency by weakening source
   binding.
@@ -32,9 +32,9 @@ tasks.
   close the remaining gap between implementation-complete and fit for purpose —
   the Communications parity-ledger rulings that never landed, the Calls media
   plane, and the operator-flagged legacy mesh-PBX retirement. They are
-  implementation-only, disjoint from the release chain, carry no new testing or
-  security-control scope, and are pre-freeze source work executable in parallel
-  by disjoint workers under the non-stall contract.
+  implementation-only, disjoint from the release chain, and pre-freeze source
+  work executable in parallel by disjoint workers. Live-seat and operator
+  testing for those epics is `WL-TEST-003` after a testing Beta.
 - **Single-authority lock:** typed Workload operations are the only VM/container
   lifecycle API; mackesd is the only daemon authority; mde-bus is the only
   platform bus; the shell renders typed bounded projections and sends typed
@@ -67,11 +67,11 @@ tasks.
   visibly `Deferred`; reactivation requires a new active epic and a newer
   governance lock after this release.
 - **Shared release-proof ownership:** first-release input admission, signed
-  artifact/package proof, installed baseline acceptance, corrected-forward
-  recovery, and deferred provider/live proofs are owned by `WL-TEST-002`.
-  Product epics must not duplicate those rollout tasks; they retain only
-  product-specific implementation and integration gaps, and cite `WL-TEST-002`
-  when its acceptance is a dependency.
+  artifact/package proof, and farm fixture gates are owned by `WL-TEST-002`.
+  Installed-seat, provider, live, and operator-testing leftovers are owned by
+  `WL-TEST-003` and execute only after a testing Beta is released. Product
+  epics must not duplicate those rollout tasks; they retain implementation
+  gaps and cite `WL-TEST-003` when live acceptance is a dependency.
 - **Production qualification topology (release lock 2026-08-16):** deep
   acceptance for `13.0.0` is exactly Seat 15, Dell, and Surface. Eagle and T480
   are non-gating inspection/deployment-wave seats. Three lighthouses remain
@@ -133,9 +133,10 @@ acceptance within Seat 15, Dell, and Surface.
 3. Re-freeze the feature-complete `13.0.0` source on the protected default branch.
 4. Build and self-sign all six canonical roles.
 5. Stage the exact unpublished candidate on the six-node production topology.
-6. Run installed-seat, provider, direct-DRM, guest/device, and recovery acceptance.
-7. Assemble and sign the final provenance/evidence bundle.
-8. Publish `magic-mesh-v13.0.0`, verify readback, and complete the staged fleet handoff.
+6. Release a testing Beta.
+7. Execute live-seat and operator testing under `WL-TEST-003`.
+8. Assemble and sign the final provenance/evidence bundle, then publish
+   `magic-mesh-v13.0.0`, verify readback, and complete the staged fleet handoff.
 
 ## Story execution contract
 
@@ -176,8 +177,10 @@ commit/push, start `automation/reconciler/tick-fill.sh` (or
 `mcnf-farm-reconcile.path` starts the same oneshot on HEAD change. Do not
 wait for the 15-min timer. Do not hand-fan a cargo command the reconciler
 already owns. When cargo is fresh at the current clean HEAD, the next act
-is `automation/drain/leftover-units.sh runnable` (live-seat and source),
-not more cargo. `@leftover:{dest-operator}` / `keep` / `release-wait` do
+is `automation/drain/leftover-units.sh runnable` (source leftovers only
+until a testing Beta exists). Live-seat, release-wait, and operator-testing
+leftovers live on `WL-TEST-003` and are not runnable while it is Blocked.
+`@leftover:{dest-operator}` / `keep` / `release-wait` on Remaining epics do
 not fill slots; they do not authorize invented dests.
 
 Local heavy `cargo` remains blocked by
@@ -235,9 +238,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: the eight owning epics contain product and release criteria.
   Surface is approved for `13.0.0`; Android/Cuttlefish is deferred. WL-REL-006
-  is parked (freeze / catalog refs / RPM secret). Coordinator leftover is
-  FUNC-023 live enroll (unpublished `13.0.0-35` is installed; freeze still
-  waits on mint + enroll/offboard). `WL-FUNC-033` archived 2026-08-24.
+  is parked (freeze / catalog refs / RPM secret). Live enroll, live-seat,
+  and operator testing moved to `WL-TEST-003` after a testing Beta.
+  Unpublished `13.0.0-35` is dest-cut, not that Beta. `WL-FUNC-033`
+  archived 2026-08-24.
   Operator 2026-08-23 authorized Remaining so the coordinator can run the
   chain; do not grind `cargo test --workspace` as filler. Evidence:
   `WL-REL-007-2026-08-22-coordinator-park-r1.md`. Exact acceptance is Dell,
@@ -250,9 +254,9 @@ is a capacity incident (§10.0.3), not a silent retry.
        only for disjoint lifecycle, surfaces, inputs, infrastructure, and release
        scopes. Execute `WL-FUNC-023`; establish the `WL-REL-001` S1 candidate
        identity; execute `WL-REL-006` against it; reconfirm and finalize
-       `WL-REL-001`; then execute `WL-REL-002`, `WL-REL-003`, pre-publication
-       `WL-TEST-002`, `WL-REL-004`, `WL-REL-005`, and final `WL-TEST-002`
-       reconciliation.
+       `WL-REL-001`; then execute `WL-REL-002`, `WL-REL-003`, a testing Beta,
+       `WL-REL-004`, `WL-REL-005`; live/operator leftover is `WL-TEST-003`
+       after that Beta, not a pre-Beta fan-out.
      - Deliverable: strict signed `ReleaseIntentV1`, `ReleaseStateV1`, and
        `ReleaseStageReceiptV1` contracts plus a restart-safe stage journal under
        `/var/lib/mcnf-release/<revision>/` binding version, source, six roles,
@@ -274,7 +278,8 @@ is a capacity incident (§10.0.3), not a silent retry.
        material through stdin or a credential descriptor with pinned host
        identity, never argv or command text. Prove minting,
        redaction, refusal, replay, SSH result, and Bus acknowledgement with farm
-       fixtures now; defer exact-candidate target execution to `WL-TEST-002`.
+       fixtures now; defer exact-candidate target execution to `WL-TEST-003`
+       after a testing Beta.
      - Deliverable: all S1-S18 deliverables and focused farm/live evidence owned
        by `WL-FUNC-023`.
      - Validation: hostile decode, replay, scope change, interruption, reboot,
@@ -344,13 +349,13 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Deliverable: exact installed identity, lifecycle, provider, direct-DRM,
        Maps, collaboration, media/device, guest-role, Surface-hardware,
        resilience, privacy-retention, lighthouse, and recovery evidence owned
-       by `WL-TEST-002`.
+       by `WL-TEST-003` after a testing Beta.
      - Validation: tested bytes match the candidate; DRM, audio, HID, sensor,
        camera, power, Cast/DLNA, provider, and guest evidence is captured by
        objective fixtures; every failure recovers by corrected-forward action
        or re-enrollment, never rollback or manual assertion.
-     - Done when: `WL-TEST-002` S1-S7 pass or reopen one exact owning
-       implementation blocker with no invented success.
+     - Done when: `WL-TEST-003` live S1-S7 pass after a testing Beta, or
+       reopen one exact owning implementation blocker with no invented success.
   7. S7 Assemble, sign, publish, and independently read back the release.
      - Inputs: qualified six-role candidate, gate matrix, SBOM producers,
        release key, release notes, GitHub authority, and package repository.
@@ -373,7 +378,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   8. S8 Reconcile and archive the complete plan.
      - Inputs: every owning epic's evidence, public readback, installed
        acceptance, worklist stewardship rules, and archive dispositions.
-     - Action: complete `WL-TEST-002` S8; map every obligation to evidence or a
+     - Action: complete `WL-TEST-003` live S8 after the testing Beta; map every obligation to evidence or a
        reopened implementation/infrastructure story; archive every completed
        owning epic and finally this coordination epic in an automated
        post-release documentation commit so the frozen revision does not move.
@@ -402,8 +407,8 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Verification method: worklist lint, focused hostile tests, meaningful gates
   across all permanent farm hosts, exact three-seat and
   three-lighthouse acceptance, signed evidence verification, clean-room public
-  readback, and repository query. @farm:{cargo test --workspace}
-  @leftover:{dest-operator} @leftover:{release-wait}
+  readback, and repository query.   @farm:{cargo test --workspace}
+  @leftover:{dest-operator}
 - Origin or merged source IDs: SOL Luna AI completion plan and Android deferral
   direction (2026-08-17).
 
@@ -422,8 +427,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   LH1–LH3. Overlay-ip + host cert + nebula kept. LH `mackesd-control`
   blocked on missing collab receipt. `production_admitted: false`.
   Evidence: `WL-FUNC-023-2026-08-25-destcut-bc14a22d7-r1.md`.
-- Remaining work: S1-S18. Dest-gated arming/Browser VM/collab SHA. Do not
-  flip `production_admitted`. Do not confirm `Restart mackesd`.
+- Remaining work: S1-S18 source/cargo. Dest-gated live leftover is
+  `WL-TEST-003` after a testing Beta. Do not flip `production_admitted`.
+  Do not confirm `Restart mackesd`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -591,27 +597,28 @@ is a capacity incident (§10.0.3), not a silent retry.
   18. S18 Prove and hand off the implementation.
       - Inputs: S1-S17, farm inventory, the three-seat `13.0.0` acceptance lock,
         preview-distribution exception, retention lock, and the
-        WL-TEST-002 ownership boundary.
+        WL-TEST-003 ownership boundary.
       - Action: run focused unit/integration/hostile farm gates, put the longest
         job on BigBoy, and record product-specific evidence.
       - Deliverable: evidence index, unattended execution runbook, migration notes, and
-        exact deferred WL-TEST-002 obligations.
+        exact deferred WL-TEST-003 live obligations.
       - Validation: worklist lints pass; detailed history expires within six
         hours; live proof uses exactly Dell, Seat 15, and Surface; any broader preview
         distribution remains manifest-bound and is not counted as proof.
       - Done when: implementation gates pass and exact installed-release/live
-        acceptance remains only under WL-TEST-002.
+        acceptance remains only under WL-TEST-003 after a testing Beta.
 - Scope: unified local/fleet lifecycle implementation, GUI/TUI rendering,
   onboarding, upgrade, correction, offboarding, erasure, recommissioning,
   Surface and virtualization checks, artifact selection, package integration,
   and focused product verification. Release publication, wider deployment, and
-  exact installed/live acceptance remain in the release chain and WL-TEST-002.
+  exact installed/live acceptance remain in the release chain and WL-TEST-003.
 - Relevant files/components: `crates/mesh/mackesd/`,
   `crates/mesh/mde-enroll/`, Construct lifecycle routes, shared mesh types,
   packaging, systemd, Kickstart/bootc, and focused verification helpers.
 - Dependencies: mackesd remains the only daemon authority; mde-bus remains the
   only platform bus; typed Workload operations remain the only VM/container
-  lifecycle API; WL-TEST-002 owns exact installed and live acceptance.
+  lifecycle API; WL-TEST-003 owns exact installed and live acceptance after
+  a testing Beta.
 - Acceptance criteria: ONBOARD & OFFBOARDING is the only human lifecycle
   interface; all renderers share one engine; capsule and release-driven token
   onboarding consume preloaded credentials without interaction; upgrades need
@@ -621,8 +628,8 @@ is a capacity incident (§10.0.3), not a silent retry.
   prominent `ReadyWithWarnings`.
 - Verification method: focused hostile/unit tests, farm integration and package
   fixtures, GUI/TUI parity, interruption/resume proof, and exactly three physical
-  acceptance seats; defer exact release/rollout proof to WL-TEST-002. @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-enroll}
-  @leftover:{dest-operator} @leftover:{live-seat}
+  acceptance seats; defer exact release/rollout proof to WL-TEST-003 after a
+  testing Beta. @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-enroll}
 - Origin or merged source IDs: lifecycle consolidation direction, Seat 15 and Surface findings, clean-fleet survey, and GPT Luna assignment (2026-08-15).
 
 ### WL-REL-001 - Freeze the newest feature-complete release source
@@ -642,16 +649,17 @@ is a capacity incident (§10.0.3), not a silent retry.
   2026-08-23 matrix (`WL-REL-001-2026-08-23-version-matrix-r1.md`;
   `check-release-version-surfaces.sh` PASS). Brand epoch `13` maps to
   Construct (`WL-REL-001-2026-08-23-construct-epoch-13-r1.md`; farm
-  `mde-theme` `22/22`). Final S1/S4 freeze still waits on live FUNC-023
-  enroll, then REL-006 admission and dest-cut SHA reconfirmation. Do not
-  declare the final freeze until that leftover closes.
+  `mde-theme` `22/22`). Live FUNC-023 enroll leftover is `WL-TEST-003`
+  after a testing Beta. Final S1/S4 freeze still needs REL-006 admission
+  and dest-cut SHA reconfirmation. Do not declare the final freeze until
+  that dest-operator leftover closes.
 - Remaining work:
-  1. S1 Select the immutable source. Candidate recorded; final freeze BLOCKED
-     on live FUNC-023 enroll: 2872293b1 / 1787447942 is the input-generation
-     candidate (`WL-REL-001-2026-08-22-input-candidate-r1.md`). Operator
-     2026-08-22 marked PR #71 Ready and authorized this record. Final freeze
-     still waits on real-seat enroll/offboard over SSH, then REL-006 admission
-     and reconfirmation. Superseded 1dfe6906 must not receive new inputs.
+  1. S1 Select the immutable source. Candidate recorded. Live FUNC-023 enroll
+     leftover is WL-TEST-003 after a testing Beta: 2872293b1 / 1787447942 is
+     the input-generation candidate (`WL-REL-001-2026-08-22-input-candidate-r1.md`).
+     Operator 2026-08-22 marked PR #71 Ready and authorized this record. Final
+     freeze still waits on REL-006 admission and reconfirmation, not live-seat
+     leftover. Superseded 1dfe6906 must not receive new inputs.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
@@ -685,7 +693,7 @@ is a capacity incident (§10.0.3), not a silent retry.
      approval/source, App VM image/catalog receipt,
      bootc receipt is not admitted for the frozen revision. Android/Cuttlefish
      is deferred and must not appear in the `13.0.0` preflight object. Maps provider/live proof
-     is explicitly deferred to WL-TEST-002; that deferral does not create a
+     is explicitly deferred to WL-TEST-003 after a testing Beta; that deferral does not create a
      release-input approval. Execute WL-REL-006 against the S1 candidate and do
      not run a build with historical loose artifacts.
      - Inputs: Maps approval/source, App VM image/catalog receipt, RPM signer
@@ -711,11 +719,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   selected; WL-REL-006 must complete against that candidate before final S1/S4
   freeze disposition. This is a two-phase reconfirmation, not a circular
   requirement for two source revisions. Signed release intent authorizes
-  self-signing; exact installed/live proof remains deferred to WL-TEST-002.
+  self-signing; exact installed/live proof remains deferred to WL-TEST-003.
 - Acceptance criteria: one clean pushed revision is frozen; all version surfaces and inputs bind to it; stale artifacts cannot enter later stages.
 - Verification method: local read-only Git/version checks, focused farm metadata/package checks, preflight admission, and evidence review.
   @farm:{cargo metadata --format-version 1}
-  @leftover:{dest-operator} @leftover:{release-wait}
+  @leftover:{dest-operator}
 - Origin or merged source IDs: release recovery of archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 responsibilities.
 
 ### WL-REL-006 - Create governed open-source release inputs
@@ -752,7 +760,7 @@ is a capacity incident (§10.0.3), not a silent retry.
        selection. Browser VM Containerfile pin now matches the admitted index
        `3a5e74e6…`.        Leftover is Maps `production_admitted`, RPM signer after freeze,
        S7 Maps/RPM `REPLACE_*`, Surface `bootc_base`, and live-seat dest
-       (WL-TEST-002). App catalog choice is Flathub LibreOffice dest.
+       (WL-TEST-003 after a testing Beta). App catalog choice is Flathub LibreOffice dest.
      - Deliverable: redacted open-source input inventory and license manifest.
       - Validation: every source is redistributable and its credential/preflight
        requirements are machine-verifiable;
@@ -779,12 +787,12 @@ is a capacity incident (§10.0.3), not a silent retry.
        production admission; not Dell/Seat 15/Surface). Envelope admits
        official TIGER clip. Leftover is `production_admitted` (needs the
        real candidate-bound provider object / freeze) and live-seat dest
-       (WL-TEST-002). Clipped PBF is not
+       (WL-TEST-003 after a testing Beta). Clipped PBF is not
        MBTiles admission. Fixture PNG raster is not production
        admission. Preserve PBF, boundary, clip,
        renderer/style/font identities, ODbL attribution, aggregate quota,
        and deterministic transport. Never fetch public OSM tiles; defer
-       installed runtime proof to WL-TEST-002.
+       installed runtime proof to WL-TEST-003.
      - Deliverable: immutable `buffalo-niagara.mbtiles`, source/build manifest,
        hashes, attribution, license, approval receipt, and package install path.
      - Validation: verify MBTiles schema, PNG payloads, TMS coordinates,
@@ -872,9 +880,10 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Relevant files/components: install-helpers/release-input-preflight.sh,
   packaging/app-vm, install-helpers/produce-bootc-digest-receipt.py,
   Maps catalog/verifier tools, and the Kiron asset verifier.
-- Dependencies: WL-FUNC-023 live enroll before freeze; WL-REL-001 S1 candidate
+- Dependencies: WL-FUNC-023 source/cargo before freeze; WL-REL-001 S1 candidate
   identity and S2 version matrix; operator-approved curated Flatpak refs; the
-  governed RPM signer secret after freeze; WL-TEST-002 for live-seat dest.
+  governed RPM signer secret after freeze; WL-TEST-003 for live-seat dest after
+  a testing Beta.
   Do not invent catalog refs. Do not guess Surface `bootc_base` while blocked.
 - Acceptance criteria: every mandatory first-release input is reproducible,
   licensed, immutable, current-revision-bound, and admitted by preflight; no
@@ -884,7 +893,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   @farm:{cargo build --workspace}
   @leftover:{dest-operator}
 - Origin or merged source IDs: WL-CRIT-006, WL-FUNC-017, WL-FUNC-018,
-  WL-FUNC-020, and the deferred WL-TEST-002 provider-proof queue.
+  WL-FUNC-020, and the deferred WL-TEST-003 provider-proof queue.
 
 ### WL-REL-002 - Cut the complete three-RPM unsigned handoff
 
@@ -898,8 +907,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   `172.20.0.131` is up (toolchain-ready;
   `WL-REL-002-2026-08-22-f44-builder-recover-r1.md`). BigBoy F42 `.130` is
   halted for that RAM handoff. Official prepare still needs Maps/catalog
-  `REPLACE_*`. Not freeze. Operator 2026-08-23 authorized Remaining; do not
-  cut the official handoff before FUNC-023 enroll and REL-006 admission.
+  `REPLACE_*`. Not freeze. Operator 2026-08-23 authorized Remaining; live
+  FUNC-023 enroll leftover is WL-TEST-003 after a testing Beta. Official
+  cut still needs REL-006 admission.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
@@ -938,7 +948,6 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: one immutable three-role handoff exists; every RPM is exact and same-source; partial or substituted sets refuse.
 - Verification method: BigBoy full RPM lane, independent Server farm lane, RPM/build-identity checks, and handoff hostile verification.
   @farm:{cargo build -p mackesd}
-  @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-001 and first-release preparation from WL-CRIT-006.
 
 ### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
@@ -1010,7 +1019,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: three RPM signatures verify without payload drift; three image roles verify; exactly six roles bind to one revision.
 - Verification method: signing and role-specific verifiers, derivative hostile suite, plan producer, and independent hash/identity comparison.
   @farm:{cargo test -p mackesd}
-  @leftover:{dest-operator} @leftover:{release-wait}
+  @leftover:{dest-operator}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016, WL-FUNC-017, and WL-CRIT-006 release roles.
 
 ### WL-REL-004 - Assemble the signed six-role release evidence bundle
@@ -1067,12 +1076,11 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Scope: evidence collection, release gates, SBOM, provenance, signatures, and publication preflight; no public mutation or seat installation.
 - Relevant files/components: install-helpers/run-first-full-release.sh, produce-release-output-plan.py,
   collect-release-outputs.py, release-gate-matrix.json, verify-release-gate-matrix.py, sign-release.sh.
-- Dependencies: WL-REL-003 and prepublication WL-TEST-002 S1-S7 qualification
-  of those exact private candidate bytes.
+- Dependencies: WL-REL-003. Live prepublication S1-S7 is WL-TEST-003 after a
+  testing Beta; do not wait on live-seat leftover to assemble the bundle.
 - Acceptance criteria: one signed immutable six-role evidence bundle passes all mandatory gates and rejects any artifact-set drift.
 - Verification method: farm gates, collector and gate verifiers, SBOM/evidence checks, detached-signature verification, and publication preflight.
   @farm:{cargo test -p mde-bus}
-  @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006 production-evidence responsibilities.
 
 ### WL-REL-005 - Publish and promote the newest complete release
@@ -1125,19 +1133,18 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Done when: package clients can resolve the complete release and no stale or unsigned higher candidate blocks upgrades.
   6. S6 Hand off to post-publication acceptance reconciliation.
      - Inputs: publication receipt, download verifier results, package/image references, and corrected-forward recovery identity.
-     - Action: update WL-TEST-002 with exact release inputs and select exactly Dell, Seat 15, and Surface as physical proof seats.
+     - Action: update WL-TEST-003 with exact release inputs and select exactly Dell, Seat 15, and Surface as physical proof seats.
      - Deliverable: acceptance handoff naming immutable artifacts, seats, lighthouses, providers, and rollback-forbidden recovery plan.
      - Validation: all references resolve and every seat mutation requires the governed alert/wait sequence.
-     - Done when: WL-TEST-002 S8 can compare public bytes with the already
+     - Done when: WL-TEST-003 live S8 can compare public bytes with the already
        qualified private candidate without guessing any identity.
 - Scope: tag, GitHub release, asset readback, signed package metadata promotion, and acceptance handoff.
 - Relevant files/components: Git remote/tag tooling, GitHub release workflow, verify-github-release-binding.sh,
-  packaging/repo, dnf-channel helpers, release notes, and WL-TEST-002.
+  packaging/repo, dnf-channel helpers, release notes, and WL-TEST-003.
 - Dependencies: WL-REL-004.
 - Acceptance criteria: tag, release, assets, signatures, provenance, and package metadata agree exactly; no partial release is visible.
 - Verification method: remote tag/release readback, clean-room asset verification, repository queries, and HOLD/partial promotion refusal.
   @farm:{cargo test -p mde-enroll}
-  @leftover:{release-wait}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, and WL-CRIT-006 publication responsibilities.
 
 ### WL-TEST-002 - Install and prove the newest complete release
@@ -1155,9 +1162,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   non-gating prior dest-cut. Compute/observation run after identity
   `Wants=`. Collab receipt SHA dest-gated. Leftover is S6 + providers.
   Operator 2026-08-23 authorized Remaining; not six-role qualification.
-  Sealed Vitelity/SIP still required for S3. No feature waiver. Evidence:
+  Sealed Vitelity/SIP still required for live S3. No feature waiver. Live
+  S1-S8 leftover moved to WL-TEST-003 after a testing Beta. Evidence:
   `WL-FUNC-023-2026-08-25-destcut-bc14a22d7-r1.md`.
-- Remaining work:
+- Remaining work: farm fixture gates only. Live S1-S8 and operator testing
+  execute on WL-TEST-003 after a testing Beta; do not fan live-seat here.
   1. S1 Admit the unpublished signed candidate.
      - Inputs: WL-REL-003 candidate manifest, signed RPM and image identities,
        real production inputs, and selected seats.
@@ -1230,8 +1239,51 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Acceptance criteria: tested bytes match the signed release; states remain honest; recovery is corrected-forward; every deferred proof is reconciled.
 - Verification method: focused farm gates followed by exact installed three-seat live checks on Dell, Seat 15, and Surface with redacted evidence and independent readback.
   @farm:{cargo test -p mde-shell-egui} @farm:{cargo test -p mackesd}
-  @leftover:{live-seat} @leftover:{release-wait}
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues from archived UX, Music, Collaboration, guest, and recovery epics.
+
+### WL-TEST-003 - Execute live-seat and operator testing after a testing Beta
+
+- Status: Blocked
+- Priority: P1
+- Complexity: Epic
+- Problem: live-seat proofs, release-wait leftovers, and operator testing were
+  attached to Remaining source and release epics, so the drain executed them
+  before a testing Beta existed.
+- Required outcome: after a testing Beta is released, execute every transferred
+  live-seat, release-wait, and operator-testing leftover on Dell, Seat 15,
+  Surface, and the three lighthouses. Do not invent dests. Do not flip
+  `production_admitted`.
+- Current state: Operator 2026-08-27 moved those leftovers here. Dest-cut
+  `bc14a22d7` (`13.0.0-35` / LH `13.0.0-11`) is not a testing Beta. This epic
+  stays Blocked until a testing Beta is released. leftover-units ignores
+  Blocked bodies, so drain must not fan live-seat now.
+- Remaining work: do not execute until a testing Beta is released. Then:
+  1. S1 Live lifecycle leftover from WL-FUNC-023 (Health Fix, dest-gated
+     arming/Browser VM/collab SHA, enroll/offboard proofs).
+  2. S2 Exact installed qualification that was WL-TEST-002 S1-S8.
+  3. S3 Operator live proofs that were WL-FUNC-024 through WL-FUNC-032
+     (calls media, Files POSIX/prefs/bookmarks, Transfers, Fleet voice
+     including Vitelity dest, SIP gateway, co-edit, hotkeys).
+  4. S4 Release-wait leftovers that were on WL-REL-007 and WL-REL-001
+     through WL-REL-005. After the testing Beta, reconcile those against
+     live evidence here; do not re-attach leftover markers to Remaining
+     source epics.
+- Scope: live-seat, release-wait, and operator testing only. Source, cargo,
+  and dest-operator admission for freeze/inputs stay on their owning epics.
+- Relevant files/components: Dell, Seat 15, Surface, LH1–LH3; Construct;
+  mackesd lifecycle; Communications/Files; release evidence helpers.
+- Dependencies: a published testing Beta (not dest-cut-only unpublished
+  candidate). Then the three-seat `13.0.0` qualification topology.
+- Acceptance criteria: every transferred leftover has live evidence or a
+  reopened owning implementation story; no invented dest; no
+  `production_admitted` flip from this epic.
+- Verification method: after Status becomes Remaining, farm fixtures then
+  live three-seat checks. @farm:{cargo test -p mde-shell-egui}
+  @farm:{cargo test -p mackesd}
+  @leftover:{live-seat} @leftover:{release-wait} @leftover:{dest-operator}
+- Origin or merged source IDs: operator 2026-08-27 leftover restructure;
+  WL-TEST-002 live queue; WL-FUNC-023/024–032 live leftovers; REL
+  release-wait leftovers.
 
 ## Feature Completion
 
@@ -1262,11 +1314,8 @@ story execution contract above.
   `/dev/video*` present; packed Calls literals in Construct. Two-seat audio not
   run (Seat 15/Dell out of this unit). Evidence:
   `WL-FUNC-024-2026-08-25-surface-live-media-r1.md`.
-- Remaining work: leftover is live two-seat audio (objective chirp/tone
-  correlation), group SFU, and PSTN after a current-revision unpublished
-  candidate is installed. Worker census and empty readiness are not a call.
-  Production loopback is unset; farm chirp is not a seat fixture. PSTN still
-  depends on FUNC-030 `gateway.toml`. Do not invent a dest.
+- Remaining work: live two-seat audio leftover is WL-TEST-003 after a testing
+  Beta. Source/cargo S1-S6 stay here. Do not invent a dest.
   1. S1 Add the typed media contracts.
      - Inputs: mde-collab-types versioning conventions and the calls.rs command
        set.
@@ -1343,7 +1392,6 @@ story execution contract above.
   docs/platform/evidence/.
   @farm:{cargo test -p mde-collab-types} @farm:{cargo test -p mackesd}
   @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mde-voice-hud}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q11/Q15 and the
   calls.rs media-plane follow-up markers.
 
@@ -1365,11 +1413,12 @@ story execution contract above.
   POSIX ops on local xfs (`/root/Local`); no lock-11 mesh mount. No
   Construct menubar click. Evidence:
   `WL-FUNC-025-2026-08-26-surface-files-posix-r1.md`.
-- Remaining work: leftover is lock-11 mesh-mounted tree plus Construct
-  Files menubar/context (test-bin OpQueue is not pid 3653). dest-cut
-  `bc14a22d7` matches current-tree menubar/dialogs FileOps wiring. Farm
-  fixture: `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md`. Surface:
-  `WL-FUNC-025-2026-08-26-surface-files-posix-r1.md`. Fixtures do not close.
+- Remaining work: live lock-11 mesh-mounted tree plus Construct Files
+  menubar leftover is WL-TEST-003 after a testing Beta. Source/cargo stays.
+  dest-cut `bc14a22d7` matches current-tree menubar/dialogs FileOps wiring.
+  Farm fixture: `WL-FUNC-025-2026-08-23-mesh-tree-archive-queue-r1.md`.
+  Surface: `WL-FUNC-025-2026-08-26-surface-files-posix-r1.md`. Fixtures
+  do not close.
   1. S1 New File and Duplicate.
      - Inputs: the shared name dialog in dialogs.rs and `OpKind::Copy`.
      - Action: add a `NewFile` name-dialog variant that creates an empty
@@ -1412,7 +1461,6 @@ story execution contract above.
 - Verification method: focused mde-files and mde-files-egui farm gates; no
   live hardware required.
   @farm:{cargo test -p mde-files-egui} @farm:{cargo test -p mde-files}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q26
   (build-new:file-manager-posix-ops), file-manager design lock 1.
 
@@ -1433,10 +1481,9 @@ story execution contract above.
   (`files_panel` not mounted). No dest JSON, no FileBrowser
   view/sort/hidden write. Evidence:
   `WL-FUNC-026-2026-08-26-dell-folder-prefs-r1.md`.
-- Remaining work: leftover is operator FileBrowser view/sort/hidden then
-  persist write on a current-revision seat (dest hydrate is not operator
-  use). Dell has the XDG pin and no persist file. Production Construct
-  does not mount `files_panel` (Files aliases Communications).
+- Remaining work: operator FileBrowser leftover is WL-TEST-003 after a testing
+  Beta. Source persist path stays here. Dell has the XDG pin and no persist
+  file. Production Construct does not mount `files_panel`.
   1. S1 Serialize on mutation and hydrate at construction.
      - Inputs: the editor-egui.json precedent (JSON under the mcnf config
        directory) and `FolderPrefs`.
@@ -1459,7 +1506,6 @@ story execution contract above.
   hostile files degrade to defaults.
 - Verification method: focused mde-files-egui farm gate.
   @farm:{cargo test -p mde-files-egui}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q28
   (build-new:file-manager-folderprefs-persist), file-manager design lock 20.
 
@@ -1478,9 +1524,9 @@ story execution contract above.
   absent; no `files-bookmarks.json`. kmsgrab frame unread as PNG. No dest
   JSON, no pin/navigate GUI. Evidence:
   `WL-FUNC-027-2026-08-25-surface-bookmarks-r1.md`.
-- Remaining work: leftover is operator pin then restart/navigate on a
-  current-revision seat (dest hydrate is not operator use). Packaged dest-cut
-  unit pins `XDG_CONFIG_HOME`; Surface has the pin and no persist file.
+- Remaining work: operator pin leftover is WL-TEST-003 after a testing Beta.
+  Source bookmark store stays here. Packaged dest-cut unit pins
+  `XDG_CONFIG_HOME`; Surface has the pin and no persist file.
   1. S1 Add the bookmark store and sidebar section.
      - Inputs: the FolderPrefs JSON precedent (WL-FUNC-026) and the existing
        Places render path.
@@ -1503,7 +1549,6 @@ story execution contract above.
   the store is bounded and hostile input refuses.
 - Verification method: focused mde-files-egui farm gate.
   @farm:{cargo test -p mde-files-egui}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q27
   (build-new:file-manager-bookmarks), file-manager design lock 21.
 
@@ -1528,15 +1573,10 @@ story execution contract above.
   leftover-028 not here. Evidence:
   `WL-FUNC-028-2026-08-25-surface-transfers-r1.md`;
   `WL-FUNC-028-2026-08-26-cli-gui-list-parity-r1.md`.
-- Remaining work: leftover is still live Construct Transfers paint/click on a
-  current-revision seat. Source CLI/GUI producer parity (add/remove/list +
-  editor refuse/trim/next-run copy) is in-tree; do not occupy Surface/Dell/
-  Seat 15. Seat 15 is a used DRM Construct with Keychron/MS116 input but no
-  capture dest and an empty store (Dell leftover-028 is not here). dest-cut
-  editor is not CLI-parity; in-tree `43459f809` plus list/trim fold matches
-  CLI (`WL-FUNC-028-2026-08-23-transfers-editor-cli-parity-r1.md`). Creating
-  an inbox, adding a pair, starting Sunshine, or injecting Ctrl+J would
-  invent dests.
+- Remaining work: live Construct Transfers leftover is WL-TEST-003 after a
+  testing Beta. Source CLI/GUI producer parity is in-tree; do not occupy
+  Surface/Dell/Seat 15. Creating an inbox, adding a pair, starting Sunshine,
+  or injecting Ctrl+J would invent dests.
   1. S1 Add the CLI producer.
      - Inputs: TransferCmd conventions and the Save/Remove verbs.
      - Action: add `mackesd transfer sync-pair add|remove|list` posting the
@@ -1568,7 +1608,6 @@ story execution contract above.
   gates.
   @farm:{cargo test -p mackesd} @farm:{cargo test -p mde-shell-egui}
   @farm:{cargo test -p mde-collab-egui}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q34
   (build-new:recurring-mirror-producer), transfers design lock.
 
@@ -1589,8 +1628,8 @@ story execution contract above.
   rows (honest empty, no master key). Provision not clicked. Vitelity
   dest-operator stays parked. Evidence:
   `WL-FUNC-029-2026-08-25-surface-voice-admin-r1.md`.
-- Remaining work: leftover is live Vitelity on a current-revision seat, not a
-  missing Activity section.
+- Remaining work: live Vitelity leftover is WL-TEST-003 after a testing Beta,
+  not a missing Activity section.
   1. S1 Panel over the existing verbs.
      - Inputs: the voice_provision verb bodies (provision, DID route,
        failover, shared config) and the Activity mode layout.
@@ -1617,7 +1656,6 @@ story execution contract above.
 - Verification method: focused mde-collab-egui and mackesd voice_provision
   farm gates.
   @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mackesd}
-  @leftover:{live-seat} @leftover:{dest-operator}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q8
   (build-new:fleet-voice-admin@Activity).
 
@@ -1638,9 +1676,8 @@ story execution contract above.
   `gateway.toml`; no set/clear. Form packed (`SIP gateway`, `No SIP gateway
   configured`). Activity paint unread. Evidence:
   `WL-FUNC-030-2026-08-25-surface-gateway-r1.md`.
-- Remaining work: leftover is live Bus set/get/clear plus a migrated
-  workgroup `gateway.toml`, not a missing GUI publisher. No credentials
-  were invented; no set-gateway was published.
+- Remaining work: live Bus set/get/clear leftover is WL-TEST-003 after a
+  testing Beta, not a missing GUI publisher. No credentials were invented.
   1. S1 Gateway section in Activity.
      - Inputs: the three verb bodies and redaction contract in ipc/voip.rs.
      - Action: a bounded gateway form (host, port, credentials) publishing
@@ -1662,7 +1699,6 @@ story execution contract above.
   the redaction contract intact.
 - Verification method: focused mde-collab-egui and mackesd voip farm gates.
   @farm:{cargo test -p mde-collab-egui} @farm:{cargo test -p mackesd}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q12
   (build-new:sip-gateway-config@Activity).
 
@@ -1684,8 +1720,8 @@ story execution contract above.
   `collab` did not spawn (identity receipt still `7e3474eeb`). No document-session
   topics. Two-seat co-edit not run (Seat 15/Dell out of this unit). Evidence:
   `WL-FUNC-031-2026-08-25-surface-coedit-r1.md`.
-- Remaining work: leftover is live two-seat co-edit evidence only, not a
-  missing mount wire.
+- Remaining work: live two-seat co-edit leftover is WL-TEST-003 after a
+  testing Beta, not a missing mount wire.
   1. S1 Share-session lifecycle UI.
      - Inputs: the documents.rs marked seams, the collab_session library, and
        space membership from the collab store.
@@ -1717,7 +1753,6 @@ story execution contract above.
 - Verification method: focused mde-collab-egui farm gates with the
   two-instance session fixture.
   @farm:{cargo test -p mde-collab-egui}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger Q21
   (defer-followup), documents.rs Phase-3c markers.
 
@@ -1737,11 +1772,8 @@ story execution contract above.
   `open_transfers` / `transfer_hotkey_refused` in-tree (farm 1591/0);
   not dest-cut yet. Evidence:
   `WL-FUNC-032-2026-08-25-destcut-keystroke-no-frame-r1.md`.
-- Remaining work: leftover is live-surface keystroke proof on Seat 15, not a
-  missing binding. Catalog and dock-journal do not close it. Needs Ctrl+J from
-  every surface and in-mode Ctrl+N, with refuse on Documents / Terminal /
-  Desktop / Browser. Injecting uinput would invent a dest and still could not
-  record the frame.
+- Remaining work: live-surface keystroke leftover is WL-TEST-003 after a
+  testing Beta, not a missing binding. Injecting uinput would invent a dest.
   1. S1 Register both bindings.
      - Inputs: the hotkeys.rs table and the Communications mode router.
      - Action: bind Ctrl+J to Surface::Communications in Transfers mode and
@@ -1761,6 +1793,5 @@ story execution contract above.
   focus-context shadowing.
 - Verification method: focused mde-shell-egui and mde-collab-egui farm gates.
   @farm:{cargo test -p mde-shell-egui} @farm:{cargo test -p mde-collab-egui}
-  @leftover:{live-seat}
 - Origin or merged source IDs: WL-FUNC-011 parity ledger
   (build-new:reserve-transfer-hotkeys).
