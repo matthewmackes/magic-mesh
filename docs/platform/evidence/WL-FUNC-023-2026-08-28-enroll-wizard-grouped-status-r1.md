@@ -30,5 +30,10 @@ MCNF_BUILD_HOST=172.20.0.170 MCNF_BUILD_SLOT=1 \
 Exit 0. Lib: `53 passed, 0 failed`. Bins: `3 passed`. Pre-existing
 `call_media.rs` dead-code warnings are out of this slice.
 
+A later overlapping run on slot 2 (slot 1 was cargo-locked) also exited 0
+with the same 53+3 counts, including
+`grouped_status_catalog_refuses_monolithic_mackesd_as_the_only_plane`.
+See `WL-FUNC-023-2026-08-28-enroll-grouped-status-r1.md`.
+
 This is source evidence only. It does not close `WL-FUNC-023` or lift
 `WL-TEST-003`.
