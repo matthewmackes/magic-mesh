@@ -10,10 +10,12 @@ tasks.
 - **19 active epics:** 18 `Remaining`, 1 `Blocked`, 0 `Needs clarification`.
   Operator 2026-08-27 moved all live-seat, release-wait, and operator-testing
   leftovers to `WL-TEST-003` (`Blocked` until a testing Beta is released).
-  Dest-cut `bc14a22d7` is not that Beta. REL dest-operator admission stays on
-  Remaining REL epics. Do not invent a mesh-id or bearer. Do not flip
-  `production_admitted`. Unpublished `13.0.0-35` / lighthouse `13.0.0-11`
-  (`bc14a22d7`) remains installed on the dest-cut set.
+  Operator 2026-08-28 skipped Construct Health Fix: do not fan or wait on a
+  DRM Fix click; that leftover executes on `WL-TEST-003` only after the
+  Test Release. Dest-cut `bc14a22d7` is not that Beta. REL dest-operator
+  admission stays on Remaining REL epics. Do not invent a mesh-id or bearer.
+  Do not flip `production_admitted`. Unpublished `13.0.0-35` / lighthouse
+  `13.0.0-11` (`bc14a22d7`) remains installed on the dest-cut set.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** implement all source-changing lifecycle work under
   `WL-FUNC-023`; record one clean pushed release-candidate revision and epoch
@@ -178,8 +180,9 @@ commit/push, start `automation/reconciler/tick-fill.sh` (or
 wait for the 15-min timer. Do not hand-fan a cargo command the reconciler
 already owns. When cargo is fresh at the current clean HEAD, the next act
 is `automation/drain/leftover-units.sh runnable` (source leftovers only
-until a testing Beta exists). Live-seat, release-wait, and operator-testing
-leftovers live on `WL-TEST-003` and are not runnable while it is Blocked.
+until a testing Beta exists). Live-seat, release-wait, operator-testing,
+and Construct Health Fix leftovers live on `WL-TEST-003` and are not
+runnable while it is Blocked. Do not stall the drain on a DRM Fix click.
 `@leftover:{dest-operator}` / `keep` / `release-wait` on Remaining epics do
 not fill slots; they do not authorize invented dests.
 
@@ -427,9 +430,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   LH1–LH3. Overlay-ip + host cert + nebula kept. LH `mackesd-control`
   blocked on missing collab receipt. `production_admitted: false`.
   Evidence: `WL-FUNC-023-2026-08-25-destcut-bc14a22d7-r1.md`.
-- Remaining work: S1-S18 source/cargo. Dest-gated live leftover is
-  `WL-TEST-003` after a testing Beta. Do not flip `production_admitted`.
-  Do not confirm `Restart mackesd`.
+- Remaining work: S1-S18 source/cargo. Dest-gated live leftover and
+  Construct Health Fix click skip to `WL-TEST-003` after a Test Release.
+  Do not flip `production_admitted`. Do not confirm `Restart mackesd`.
   1. S1 Define the canonical lifecycle and readiness model.
      - Inputs: governance locks, health contracts, role provisioning, packaging,
        Seat 15 findings, and Surface acceptance contracts.
@@ -1256,10 +1259,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Current state: Operator 2026-08-27 moved those leftovers here. Dest-cut
   `bc14a22d7` (`13.0.0-35` / LH `13.0.0-11`) is not a testing Beta. This epic
   stays Blocked until a testing Beta is released. leftover-units ignores
-  Blocked bodies, so drain must not fan live-seat now.
+  Blocked bodies, so drain must not fan live-seat now. Operator 2026-08-28
+  skipped Construct Health Fix until that Test Release exists.
 - Remaining work: do not execute until a testing Beta is released. Then:
-  1. S1 Live lifecycle leftover from WL-FUNC-023 (Health Fix, dest-gated
-     arming/Browser VM/collab SHA, enroll/offboard proofs).
+  1. S1 Live lifecycle leftover from WL-FUNC-023 (Construct Health Fix
+     click on the DRM seat, dest-gated arming/Browser VM/collab SHA,
+     enroll/offboard proofs).
   2. S2 Exact installed qualification that was WL-TEST-002 S1-S8.
   3. S3 Operator live proofs that were WL-FUNC-024 through WL-FUNC-032
      (calls media, Files POSIX/prefs/bookmarks, Transfers, Fleet voice
@@ -1282,6 +1287,7 @@ is a capacity incident (§10.0.3), not a silent retry.
   @farm:{cargo test -p mackesd}
   @leftover:{live-seat} @leftover:{release-wait} @leftover:{dest-operator}
 - Origin or merged source IDs: operator 2026-08-27 leftover restructure;
+  operator 2026-08-28 skipped Construct Health Fix until the Test Release;
   WL-TEST-002 live queue; WL-FUNC-023/024–032 live leftovers; REL
   release-wait leftovers.
 
