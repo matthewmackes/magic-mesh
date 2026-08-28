@@ -10,17 +10,245 @@
 #      prompt (cached read) and greeting (snapshot + bounded live refresh) use.
 #
 # Pure shell + python3 (already a platform dep). Degrades gracefully when the
-# workgroup mount is absent (writes a self-only snapshot).
+# workgroup mount is absent (writes a self-only snapshot). Lighthouse rows in
+# nodes[] come from nebula static_host_map KEYS + overlay ping, not mesh-storage.
 set -u
 
 WG="${MDE_WORKGROUP_ROOT:-/mnt/mesh-storage}"
 SELF="$(cat /proc/sys/kernel/hostname 2>/dev/null | tr -d '[:space:]')"
-OUT=/run/mde/mesh-status.json
-mkdir -p /run/mde 2>/dev/null || true
+OUT="${MDE_MESH_STATUS_OUT:-/run/mde/mesh-status.json}"
 
 active() { systemctl is-active --quiet "$1" 2>/dev/null && echo true || echo false; }
 running() { pgrep -x "$1" >/dev/null 2>&1 && echo true || echo false; }
 yesno()  { [ "$1" = true ] && echo true || echo false; }
+
+# Overlay IPs of lighthouses = static_host_map KEYS (the line-leading IP).
+# Values are public ip:port and must not be treated as overlay members.
+parse_lighthouse_overlay_ips() {
+    local cfg="$1"
+    [ -n "$cfg" ] && [ -r "$cfg" ] || return 0
+    awk '/^static_host_map:/{f=1;next} f&&/^[^[:space:]#]/{f=0} f' "$cfg" 2>/dev/null \
+        | sed -nE 's/^[[:space:]]*"?([0-9]{1,3}(\.[0-9]{1,3}){3})"?[[:space:]]*:.*/\1/p' \
+        | sort -u | head -16 | paste -sd, -
+}
+
+# Probe each overlay IP already in NET_LHIPS. Prints ip=online,ip=unreachable
+# (comma-separated). Presence is online only when a single ICMP echo succeeds
+# on the overlay iface when known. Does not invent IPs. Fail-closed: a missed
+# probe file is unreachable.
+probe_lighthouse_presence() {
+    local ips="$1" iface="${2:-}" ip tmp st first=1
+    [ -n "$ips" ] || return 0
+    tmp="$(mktemp -d "${TMPDIR:-/tmp}/mesh-status-lh.XXXXXX")" || return 0
+    local IFS=,
+    for ip in $ips; do
+        ip="${ip// /}"
+        [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
+        (
+            if [ -n "$iface" ]; then
+                ping -c1 -W1 -I "$iface" "$ip" >/dev/null 2>&1
+            else
+                ping -c1 -W1 "$ip" >/dev/null 2>&1
+            fi
+            if [ $? -eq 0 ]; then echo online; else echo unreachable; fi > "$tmp/$ip"
+        ) &
+    done
+    wait
+    for ip in $ips; do
+        ip="${ip// /}"
+        [[ "$ip" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] || continue
+        st="$(cat "$tmp/$ip" 2>/dev/null || echo unreachable)"
+        case "$st" in online) ;; *) st=unreachable ;; esac
+        if [ "$first" = 1 ]; then
+            printf '%s=%s' "$ip" "$st"
+            first=0
+        else
+            printf ',%s=%s' "$ip" "$st"
+        fi
+    done
+    rm -rf "$tmp"
+}
+
+self_test() {
+    local cfg out pingbin got want nodes_json
+    MESH_STATUS_ST_TMP="$(mktemp -d "${TMPDIR:-/tmp}/mesh-status-st.XXXXXX")" || {
+        echo "mesh-status-snapshot: --self-test mktemp failed" >&2
+        return 1
+    }
+    cleanup_self_test() {
+        case "${MESH_STATUS_ST_TMP:-}" in
+            "${TMPDIR:-/tmp}"/mesh-status-st.*) rm -rf -- "$MESH_STATUS_ST_TMP" ;;
+        esac
+    }
+    trap cleanup_self_test EXIT
+    tmp="$MESH_STATUS_ST_TMP"
+    cfg="$tmp/nebula.yaml"
+    cat > "$cfg" <<'YAML'
+pki:
+  ca: /etc/nebula/ca.crt
+static_host_map:
+  "10.42.0.1":
+    - "203.0.113.10:4242"
+  "10.42.0.2": ["198.51.100.2:4242"]
+  10.42.0.3: ["192.0.2.3:4242"]
+lighthouse:
+  am_lighthouse: false
+  hosts:
+    - "10.42.0.1"
+listen:
+  host: 0.0.0.0
+YAML
+    got="$(parse_lighthouse_overlay_ips "$cfg")"
+    want="10.42.0.1,10.42.0.2,10.42.0.3"
+    [ "$got" = "$want" ] || {
+        echo "mesh-status-snapshot: --self-test expected keys $want, got ${got:-<empty>}" >&2
+        return 1
+    }
+    case "$got" in
+        *203.0.113.*|*198.51.100.*|*192.0.2.3*)
+            echo "mesh-status-snapshot: --self-test leaked static_host_map VALUES" >&2
+            return 1
+            ;;
+    esac
+    [ -z "$(parse_lighthouse_overlay_ips "$tmp/missing.yaml")" ] || {
+        echo "mesh-status-snapshot: --self-test invented IPs from a missing config" >&2
+        return 1
+    }
+
+    mkdir -p "$tmp/bin"
+    cat > "$tmp/bin/ping" <<'SH'
+#!/bin/bash
+ip=""
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -c|-W|-I) shift 2 ;;
+        -*) shift ;;
+        *) ip="$1"; shift ;;
+    esac
+done
+case "$ip" in
+    10.42.0.1|10.42.0.3) exit 0 ;;
+    *) exit 1 ;;
+esac
+SH
+    chmod +x "$tmp/bin/ping"
+    pingbin="$tmp/bin"
+    got="$(PATH="$pingbin:$PATH" probe_lighthouse_presence "$want" "nebula1")"
+    [ "$got" = "10.42.0.1=online,10.42.0.2=unreachable,10.42.0.3=online" ] || {
+        echo "mesh-status-snapshot: --self-test presence map mismatch: ${got:-<empty>}" >&2
+        return 1
+    }
+
+    nodes_json='[{"hostname":"ws-a","overlay_ip":"10.42.0.5","presence":"online","last_seen_ms":1,"version":"13.0.0","services":{"nebula":true},"role":"workstation"}]'
+    out="$(NET_LHIPS="$want" NET_LH_PRESENCE="$got" python3 -c '
+import json, os, sys
+nodes=json.loads(sys.argv[1])
+def split(v):
+    return [x for x in (os.environ.get(v,"") or "").split(",") if x]
+lh_ips=split("NET_LHIPS")
+presence={}
+for item in (os.environ.get("NET_LH_PRESENCE","") or "").split(","):
+    if "=" not in item: continue
+    ip, st=item.split("=",1)
+    if ip: presence[ip]= "online" if st=="online" else "unreachable"
+now_ms=2
+seen=set()
+for n in nodes:
+    ip=n.get("overlay_ip") or ""
+    if ip: seen.add(ip)
+    if ip in presence:
+        n["role"]="lighthouse"
+        n["presence"]=presence[ip]
+        if not n.get("last_seen_ms"):
+            n["last_seen_ms"]=now_ms
+for ip in lh_ips:
+    if not ip or ip in seen: continue
+    nodes.append({"hostname":ip,"overlay_ip":ip,
+                  "presence":presence.get(ip,"unreachable"),
+                  "last_seen_ms":now_ms,"version":None,"services":{},
+                  "role":"lighthouse"})
+    seen.add(ip)
+print(json.dumps(nodes, separators=(",",":")))
+' "$nodes_json")" || {
+        echo "mesh-status-snapshot: --self-test python inject failed" >&2
+        return 1
+    }
+    python3 -c '
+import json, sys
+nodes=json.loads(sys.argv[1])
+by_ip={n.get("overlay_ip"): n for n in nodes}
+assert len(nodes)==4, nodes
+ws=by_ip["10.42.0.5"]
+assert ws["hostname"]=="ws-a" and ws["role"]=="workstation" and ws["presence"]=="online", ws
+for ip, st in (("10.42.0.1","online"),("10.42.0.2","unreachable"),("10.42.0.3","online")):
+    n=by_ip[ip]
+    assert n["role"]=="lighthouse" and n["presence"]==st and n["hostname"]==ip, n
+assert "203.0.113.10" not in by_ip
+' "$out" || {
+        echo "mesh-status-snapshot: --self-test nodes[] shape failed: $out" >&2
+        return 1
+    }
+
+    # Existing lighthouse overlay row is retagged, not duplicated; empty NET_LHIPS
+    # must not invent rows.
+    out="$(NET_LHIPS="10.42.0.1" NET_LH_PRESENCE="10.42.0.1=online" python3 -c '
+import json, os, sys
+nodes=[{"hostname":"lh1","overlay_ip":"10.42.0.1","presence":"offline","role":"server","services":{}}]
+lh_ips=[x for x in os.environ.get("NET_LHIPS","").split(",") if x]
+presence={"10.42.0.1":"online"}
+seen=set()
+for n in nodes:
+    ip=n.get("overlay_ip") or ""
+    if ip: seen.add(ip)
+    if ip in presence:
+        n["role"]="lighthouse"
+        n["presence"]=presence[ip]
+for ip in lh_ips:
+    if ip and ip not in seen:
+        nodes.append({"hostname":ip,"overlay_ip":ip,"presence":"online","role":"lighthouse"})
+print(json.dumps(nodes))
+')"
+    python3 -c '
+import json, sys
+nodes=json.loads(sys.argv[1])
+assert len(nodes)==1, nodes
+assert nodes[0]["hostname"]=="lh1"
+assert nodes[0]["role"]=="lighthouse" and nodes[0]["presence"]=="online"
+' "$out" || {
+        echo "mesh-status-snapshot: --self-test retag/no-duplicate failed: $out" >&2
+        return 1
+    }
+    out="$(NET_LHIPS="" NET_LH_PRESENCE="" python3 -c '
+import json, os
+nodes=[{"hostname":"ws-a","overlay_ip":"10.42.0.5","role":"workstation"}]
+lh_ips=[x for x in os.environ.get("NET_LHIPS","").split(",") if x]
+for ip in lh_ips:
+    nodes.append({"hostname":ip,"role":"lighthouse"})
+print(len(nodes), len(lh_ips))
+')"
+    [ "$out" = "1 0" ] || {
+        echo "mesh-status-snapshot: --self-test empty NET_LHIPS invented rows: $out" >&2
+        return 1
+    }
+    grep -Fq 'lh_presence.get(ip,"unreachable")' "$0" || {
+        echo "mesh-status-snapshot: --self-test missing aggregator lighthouse inject" >&2
+        return 1
+    }
+    awk '/^python3 - "\$OUT" <<'\''PY'\''/{f=1;next} f&&/^PY$/{exit} f' "$0" > "$tmp/agg.py"
+    python3 -m py_compile "$tmp/agg.py" || {
+        echo "mesh-status-snapshot: --self-test aggregator python failed to compile" >&2
+        return 1
+    }
+    echo "mesh-status-snapshot: self-test passed"
+}
+
+if [ "${1:-}" = "--self-test" ]; then
+    [ "$#" -eq 1 ] || { echo "usage: $0 --self-test" >&2; exit 2; }
+    self_test
+    exit 0
+fi
+
+mkdir -p "$(dirname "$OUT")" 2>/dev/null || true
 
 # ── 1. publish this node's services + version ───────────────────────────────
 VER="$(rpm -q --qf '%{VERSION}' magic-mesh 2>/dev/null)"; [ -z "$VER" ] && VER="unknown"
@@ -279,7 +507,11 @@ fi
 # 100.64.22.11) with mackesd's rendered REAL `config.yaml`. Reading both leaked
 # the example placeholders into the cipher / gateway / lighthouse fields. Read
 # the real rendered config only (fall back to the example if it's somehow absent).
-NEB_CFG="/etc/nebula/config.yaml"; [ -f "$NEB_CFG" ] || NEB_CFG="/etc/nebula/config.yml"
+if [ -n "${MDE_NEBULA_CONFIG:-}" ]; then
+    NEB_CFG="$MDE_NEBULA_CONFIG"
+else
+    NEB_CFG="/etc/nebula/config.yaml"; [ -f "$NEB_CFG" ] || NEB_CFG="/etc/nebula/config.yml"
+fi
 # Nebula lighthouse public endpoints (external gateways) from static_host_map.
 NET_GWEPS="$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' "$NEB_CFG" 2>/dev/null | sort -u | head -8 | paste -sd, -)"
 # LIGHTHOUSE-9 — the lighthouse OVERLAY IPs = the static_host_map KEYS (the line-
@@ -287,8 +519,13 @@ NET_GWEPS="$(grep -hoE '([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+' "$NEB_CFG" 2>/dev/nu
 # "which nodes are lighthouses" signal (Nebula membership), independent of the
 # deployment role.toml — the anchor nodes run as Server tier for storage, so
 # `role==lighthouse` under-reports. The GUI matches a peer's overlay_ip against
-# this set OR role==lighthouse.
-NET_LHIPS="$(awk '/^static_host_map:/{f=1;next} f&&/^[^[:space:]#]/{f=0} f' "$NEB_CFG" 2>/dev/null | sed -nE 's/^[[:space:]]*"?([0-9]{1,3}(\.[0-9]{1,3}){3})"?[[:space:]]*:.*/\1/p' | sort -u | head -16 | paste -sd, -)"
+# this set OR role==lighthouse. Health's reachable_lighthouses count reads
+# nodes[] rows with role==lighthouse, so those IPs are also injected below
+# from overlay ping — not from mesh-storage shell-status.
+NET_LHIPS="$(parse_lighthouse_overlay_ips "$NEB_CFG")"
+# Overlay ping per static_host_map key. online iff one ICMP echo succeeds;
+# otherwise unreachable. Empty when no keys were parsed (do not invent IPs).
+NET_LH_PRESENCE="$(probe_lighthouse_presence "$NET_LHIPS" "$NET_IF")"
 # Nebula tunnel cipher strength (NEB-CRYPTO-LABEL). The snapshot runs as root so
 # it can read the root-only config; the bell applet reads the friendly label here
 # (world-readable /run/mde/mesh-status.json) instead of the unreadable config.
@@ -321,6 +558,7 @@ WG="$WG" SELF="$SELF" SELF_VER="$VER" PLATFORM_VERSION="$VER" \
 ETCD_MODE="$ETCD_MODE" ETCD_PEERS="$ETCD_PEERS" ETCD_LEADER="$ETCD_LEADER" \
 NET_IF="$NET_IF" NET_IP="$NET_IP" NET_CIDR="$NET_CIDR" NET_ROUTES="$NET_ROUTES" \
 NET_DEFGW="$NET_DEFGW" NET_GWEPS="$NET_GWEPS" NET_CIPHER="$NET_CIPHER" NET_LHIPS="$NET_LHIPS" \
+NET_LH_PRESENCE="$NET_LH_PRESENCE" \
 NM_PROVIDER_STATUS="$NM_PROVIDER_STATUS" MM_PROVIDER_STATUS="$MM_PROVIDER_STATUS" \
 PP_ACTIVE="$PP_ACTIVE" PP_LIST="$PP_LIST" \
 AUDIO_PULSE="$AUDIO_PULSE" AUDIO_PIPEWIRE="$AUDIO_PIPEWIRE" \
@@ -380,6 +618,45 @@ if not nodes and self_host:
     nodes=[{"hostname":self_host,"overlay_ip":"","presence":"online",
             "last_seen_ms":int(time.time()*1000),"version":os.environ.get("SELF_VER"),"services":{}}]
     if os.environ.get("SELF_VER"): versions.add(os.environ["SELF_VER"])
+# Lighthouse rows for Health honesty: inject static_host_map overlay IPs so
+# reachable_lighthouses does not depend on mesh-storage shell-status. Presence
+# is online iff overlay ping succeeded, else unreachable. Do not invent IPs.
+# Workstation aggregation above is left intact; an existing row with the same
+# overlay_ip is retagged role=lighthouse instead of duplicated.
+def _overlay_ip(value):
+    text=(value or "").strip()
+    parts=text.split(".")
+    if len(parts)!=4: return ""
+    try:
+        if all(p.isdigit() and 0<=int(p)<=255 for p in parts):
+            return text
+    except ValueError:
+        return ""
+    return ""
+lh_presence={}
+for item in (os.environ.get("NET_LH_PRESENCE","") or "").split(","):
+    if "=" not in item: continue
+    ip, st=item.split("=",1)
+    ip=_overlay_ip(ip); st=st.strip()
+    if ip: lh_presence[ip] = "online" if st=="online" else "unreachable"
+lh_ips=[ip for ip in (_overlay_ip(x) for x in (os.environ.get("NET_LHIPS","") or "").split(",")) if ip]
+now_ms=int(time.time()*1000)
+seen_overlay=set()
+for n in nodes:
+    ip=_overlay_ip(n.get("overlay_ip") or "")
+    if ip: seen_overlay.add(ip)
+    if ip in lh_presence:
+        n["role"]="lighthouse"
+        n["presence"]=lh_presence[ip]
+        if not n.get("last_seen_ms"):
+            n["last_seen_ms"]=now_ms
+for ip in lh_ips:
+    if not ip or ip in seen_overlay: continue
+    nodes.append({"hostname":ip,"overlay_ip":ip,
+                  "presence":lh_presence.get(ip,"unreachable"),
+                  "last_seen_ms":now_ms,"version":None,"services":{},
+                  "role":"lighthouse"})
+    seen_overlay.add(ip)
 def vkey(v):
     try: return tuple(int(x) for x in v.split("."))
     except Exception: return (0,)
