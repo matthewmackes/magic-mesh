@@ -12,3 +12,5 @@ pub mod lifecycle_view;
 pub mod public_roster;
 pub mod setup;
 pub mod setup_action;
+/// WL-FUNC-023 S17 leftover — Status/self-test uses the live grouped plane.
+pub mod wizard_status;

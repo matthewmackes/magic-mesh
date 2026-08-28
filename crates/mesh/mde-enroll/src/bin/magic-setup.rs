@@ -32,8 +32,9 @@ use mde_enroll::commissioning_view::JoinTokenView;
 use mde_enroll::setup::{Screen, Wizard};
 use mde_enroll::setup_action::{
     add_peer_argv, found_argv, is_active_argv, join_argv, peers_argv, remove_peer_argv,
-    run_streaming, self_test_argv, wizard_services, SetupRole,
+    run_streaming, self_test_argv, SetupRole,
 };
+use mde_enroll::wizard_status::{grouped_plane_installed, status_units};
 
 /// The action screens that collect one input value before running a verb.
 fn screen_prompt(screen: Screen) -> Option<&'static str> {
@@ -64,6 +65,9 @@ const JOIN_HELP: &[&str] = &[
     "This node enrolls behind that token, brings the overlay up, and mounts Mesh",
     "Sync. Tab switches this node's role (Workstation · Lighthouse).",
 ];
+
+/// Add-peer can mint from any enrolled node, not only a founded lighthouse.
+const ADD_PEER_FAILED: &str = "✗ add-peer failed — is this node enrolled?";
 
 fn main() -> anyhow::Result<()> {
     let configured = mde_role::load().is_ok();
@@ -263,9 +267,9 @@ fn run_join(wiz: &mut Wizard, token: &str, role: SetupRole) {
 /// classifies the missing lighthouse as skipped, never red.
 fn run_self_test(wiz: &mut Wizard, role: SetupRole) {
     wiz.push_log("— self-test: mesh services —".to_string());
-    for unit in wizard_services(role) {
+    for unit in status_units(role, grouped_plane_installed()) {
         let mut state = String::from("unknown");
-        run_streaming(&is_active_argv(unit), |l| state = l);
+        run_streaming(&is_active_argv(&unit), |l| state = l);
         let glyph = if state == "active" { "✓" } else { "✗" };
         wiz.push_log(format!("{glyph} {unit:<22} {state}"));
     }
@@ -315,7 +319,7 @@ fn run_add_peer(wiz: &mut Wizard, role: SetupRole) {
             "↑ paste that token into the new node's `magic-setup` Join screen.".to_string(),
         );
     } else {
-        wiz.push_log("✗ add-peer failed — is this a founded lighthouse?".to_string());
+        wiz.push_log(ADD_PEER_FAILED.to_string());
     }
 }
 
@@ -340,9 +344,9 @@ fn run_status(wiz: &mut Wizard) {
         mde_role::Role::Workstation => SetupRole::Workstation,
     };
     wiz.push_log(format!("— status — role: {} —", role));
-    for unit in wizard_services(setup_role) {
+    for unit in status_units(setup_role, grouped_plane_installed()) {
         let mut state = String::from("unknown");
-        run_streaming(&is_active_argv(unit), |l| state = l);
+        run_streaming(&is_active_argv(&unit), |l| state = l);
         let glyph = if state == "active" { "✓" } else { "✗" };
         wiz.push_log(format!("{glyph} {unit:<22} {state}"));
     }
@@ -824,5 +828,14 @@ mod tests {
         );
         assert!(redacted.iter().any(|l| l.contains("bearer withheld")));
         assert!(redacted.iter().any(|l| l.contains("signature withheld")));
+    }
+
+    #[test]
+    fn add_peer_failure_copy_is_not_lighthouse_only() {
+        assert!(ADD_PEER_FAILED.contains("enrolled"));
+        assert!(
+            !ADD_PEER_FAILED.to_ascii_lowercase().contains("lighthouse"),
+            "add-peer must not imply only a founded lighthouse can mint: {ADD_PEER_FAILED}"
+        );
     }
 }

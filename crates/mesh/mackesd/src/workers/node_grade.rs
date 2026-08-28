@@ -158,6 +158,8 @@ struct CpuCounters {
 struct MeshNode {
     hostname: String,
     #[serde(default)]
+    overlay_ip: String,
+    #[serde(default)]
     role: Option<String>,
     #[serde(default)]
     presence: Option<String>,
@@ -171,11 +173,68 @@ struct MeshNode {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
+struct MeshNetwork {
+    #[serde(default)]
+    lighthouse_ips: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 struct MeshStatus {
     #[serde(default)]
     revision: Option<String>,
     #[serde(default)]
     nodes: Vec<MeshNode>,
+    #[serde(default)]
+    network: MeshNetwork,
+}
+
+fn mesh_node_overlay_up(node: &MeshNode) -> bool {
+    !matches!(node.presence.as_deref(), Some("offline" | "unreachable"))
+}
+
+/// Count reachable lighthouses from a mesh-status snapshot.
+///
+/// Prefer `nodes[]` presence when a row is a lighthouse (`role == lighthouse`
+/// or its overlay IP is in `network.lighthouse_ips`). Listed lighthouse overlay
+/// IPs that are absent from `nodes[]` remain roster candidates and count as
+/// reachable when this node's overlay is up. An empty lighthouse-row set with a
+/// non-empty `lighthouse_ips` list therefore does not collapse to zero.
+fn reachable_lighthouse_count(snapshot: &MeshStatus, overlay_up: bool) -> usize {
+    let listed: BTreeSet<String> = snapshot
+        .network
+        .lighthouse_ips
+        .iter()
+        .map(|ip| ip.trim())
+        .filter(|ip| !ip.is_empty())
+        .map(ToOwned::to_owned)
+        .collect();
+
+    let mut matched_ips = BTreeSet::new();
+    let mut reachable = 0usize;
+
+    for node in &snapshot.nodes {
+        let ip = node.overlay_ip.trim();
+        let listed_hit = !ip.is_empty() && listed.contains(ip);
+        let role_lh = node.role.as_deref() == Some("lighthouse");
+        if !listed_hit && !role_lh {
+            continue;
+        }
+        if !ip.is_empty() && !matched_ips.insert(ip.to_string()) {
+            continue;
+        }
+        if mesh_node_overlay_up(node) {
+            reachable += 1;
+        }
+    }
+
+    let unmatched = listed
+        .iter()
+        .filter(|ip| !matched_ips.contains(*ip))
+        .count();
+    if overlay_up {
+        reachable += unmatched;
+    }
+    reachable
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -410,15 +469,9 @@ impl HealthSampler for SystemSampler {
                     .collect()
             })
             .unwrap_or_else(|| BTreeSet::from([self.host.clone()]));
+        let overlay_up = local.is_some_and(mesh_node_overlay_up);
         let reachable_lighthouses = mesh.as_ref().map_or(0, |snapshot| {
-            snapshot
-                .nodes
-                .iter()
-                .filter(|node| {
-                    node.role.as_deref() == Some("lighthouse")
-                        && !matches!(node.presence.as_deref(), Some("offline" | "unreachable"))
-                })
-                .count()
+            reachable_lighthouse_count(snapshot, overlay_up)
         });
         HealthObservations {
             role: local
@@ -438,9 +491,7 @@ impl HealthSampler for SystemSampler {
                 .then(|| self.audio_cached())
                 .flatten(),
             mesh_snapshot_present: mesh.is_some(),
-            overlay_up: local.is_some_and(|node| {
-                !matches!(node.presence.as_deref(), Some("offline" | "unreachable"))
-            }),
+            overlay_up,
             reachable_lighthouses,
             firmware_refresh_failed: Command::new("systemctl")
                 .args(["is-failed", "--quiet", "fwupd-refresh.service"])
@@ -3407,6 +3458,43 @@ mod tests {
                 categories: Vec::new(),
             }),
         }
+    }
+
+    #[test]
+    fn reachable_lighthouses_use_listed_ips_when_nodes_omit_lighthouse_rows() {
+        let snapshot: MeshStatus = serde_json::from_str(
+            r#"{
+                "nodes": [
+                    {"hostname":"Basement-Test-Workstation","role":"workstation","presence":"online","overlay_ip":"10.42.0.5"},
+                    {"hostname":"DELL-LAPTOP","role":"workstation","presence":"online","overlay_ip":"10.42.0.4"},
+                    {"hostname":"surface","role":"workstation","presence":"online","overlay_ip":"10.42.0.7"}
+                ],
+                "network": {"lighthouse_ips": ["10.42.0.1", "10.42.0.2", "10.42.0.3"]}
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(reachable_lighthouse_count(&snapshot, true), 3);
+        assert_eq!(reachable_lighthouse_count(&snapshot, false), 0);
+
+        let mut no_ips = snapshot.clone();
+        no_ips.network.lighthouse_ips.clear();
+        assert_eq!(reachable_lighthouse_count(&no_ips, true), 0);
+
+        let mut with_offline_match = snapshot;
+        with_offline_match.nodes.push(MeshNode {
+            hostname: "lh1".into(),
+            overlay_ip: "10.42.0.1".into(),
+            role: Some("lighthouse".into()),
+            presence: Some("offline".into()),
+            ..Default::default()
+        });
+        assert_eq!(reachable_lighthouse_count(&with_offline_match, true), 2);
+
+        let role_only: MeshStatus = serde_json::from_str(
+            r#"{"nodes":[{"hostname":"lh1","role":"lighthouse","presence":"online"}]}"#,
+        )
+        .unwrap();
+        assert_eq!(reachable_lighthouse_count(&role_only, false), 1);
     }
 
     #[test]

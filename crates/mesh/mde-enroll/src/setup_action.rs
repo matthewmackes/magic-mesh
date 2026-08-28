@@ -279,9 +279,17 @@ mod tests {
     fn role_args_match_mackesd_vocabulary() {
         assert_eq!(SetupRole::Lighthouse.as_arg(), "lighthouse");
         assert_eq!(SetupRole::Workstation.as_arg(), "workstation");
-        assert_eq!(wizard_services(SetupRole::Lighthouse).len(), 7);
-        assert_eq!(wizard_services(SetupRole::Workstation).len(), 8);
-        assert!(wizard_services(SetupRole::Workstation).contains(&"mde-shell-egui.service"));
+        let lighthouse = wizard_services(SetupRole::Lighthouse);
+        let workstation = wizard_services(SetupRole::Workstation);
+        // Rank-0 control plane (7) plus workstation node-virt extras (6).
+        assert_eq!(lighthouse.len(), 7);
+        assert!(lighthouse.contains(&"nebula.service"));
+        assert!(!lighthouse.contains(&"mde-shell-egui.service"));
+        assert_eq!(workstation.len(), 13);
+        assert!(workstation.contains(&"mde-shell-egui.service"));
+        assert!(workstation.contains(&"mcnf-node-virt.service"));
+        assert!(workstation.contains(&"virtqemud.socket"));
+        assert!(workstation.contains(&"podman.socket"));
     }
 
     #[test]

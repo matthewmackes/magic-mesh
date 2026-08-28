@@ -26,6 +26,10 @@ use mde_role::Role;
 /// while `gather_live` runs, so `systemctl is-active --quiet` can never pass.
 const FIRSTBOOT_SELF_UNIT: &str = "mcnf-lifecycle-firstboot.service";
 
+/// Dest-gated Open Onboarding unit. Health/node-grade may warn; first-boot
+/// must not treat it as a required plane unit or invent a dest receipt.
+const COLLAB_IDENTITY_UNIT: &str = "mcnf-collaboration-identity.service";
+
 /// Marker written only after the canonical baseline has no blocking checks.
 pub const FIRSTBOOT_CONVERGED: &str = "firstboot-converged";
 /// Marker written when first-boot queued corrected-forward convergence.
@@ -108,12 +112,7 @@ pub fn assemble(facts: &FirstbootFacts) -> Vec<LifecycleRequirementCheckV1> {
                 None,
             ),
             "units" => {
-                let missing: Vec<&str> = facts
-                    .expected_units
-                    .iter()
-                    .filter(|unit| !facts.active_units.iter().any(|active| active == *unit))
-                    .map(String::as_str)
-                    .collect();
+                let missing = missing_required_units(facts);
                 let observed = if missing.is_empty() {
                     "all role units active".to_owned()
                 } else {
@@ -229,10 +228,7 @@ pub fn assemble(facts: &FirstbootFacts) -> Vec<LifecycleRequirementCheckV1> {
                 (!facts.hardware_usable).then_some("hardware capability withdrawn".to_owned()),
             ),
             "verification" => {
-                let units_missing = facts
-                    .expected_units
-                    .iter()
-                    .any(|unit| !facts.active_units.iter().any(|active| active == unit));
+                let units_missing = !missing_required_units(facts).is_empty();
                 let others_block = !facts.package_present
                     || units_missing
                     || !facts.configuration_present
@@ -376,12 +372,15 @@ pub fn gather_live(target_id: &str, generation: u64, role: Role) -> FirstbootFac
 /// enable/mask set (including this oneshot and, on every rank, `etcd.service`
 /// plus monolithic `mackesd.service`). First-boot facts must match the live
 /// plane: grouped `mackesd-*.service` when shipped, no self-check, and no
-/// workstation etcd member.
+/// workstation etcd member. Dest-gated collaboration-identity is Open
+/// Onboarding, not a first-boot unit block; workstation grouped plane also
+/// drops timer units leaked from the enable/mask catalog.
 #[must_use]
 pub fn runtime_expected_units(role: Role, grouped_control_unit_file_present: bool) -> Vec<String> {
     let mut units: Vec<String> = units_for_role(role)
         .into_iter()
         .filter(|unit| *unit != FIRSTBOOT_SELF_UNIT)
+        .filter(|unit| !is_open_onboarding_unit(unit))
         .map(str::to_owned)
         .collect();
     if grouped_control_unit_file_present {
@@ -394,8 +393,36 @@ pub fn runtime_expected_units(role: Role, grouped_control_unit_file_present: boo
     }
     if role == Role::Workstation {
         units.retain(|unit| unit != "etcd.service");
+        if grouped_control_unit_file_present {
+            units.retain(|unit| !is_timer_unit(unit));
+        }
     }
+    units.retain(|unit| !is_open_onboarding_unit(unit));
     units
+}
+
+/// Dest-gated collaboration identity is Open Onboarding, not a first-boot
+/// plane requirement. Matches the shipped unit and any `units_for_role` leak
+/// that carries the same identity name.
+fn is_open_onboarding_unit(unit: &str) -> bool {
+    unit == COLLAB_IDENTITY_UNIT || unit.contains("collaboration-identity")
+}
+
+fn is_timer_unit(unit: &str) -> bool {
+    unit.ends_with(".timer")
+}
+
+/// Missing units that actually block the first-boot `units` row. Open
+/// Onboarding collab-identity is skipped even if a catalog leak planted it
+/// on [`FirstbootFacts::expected_units`].
+fn missing_required_units(facts: &FirstbootFacts) -> Vec<&str> {
+    facts
+        .expected_units
+        .iter()
+        .filter(|unit| !is_open_onboarding_unit(unit))
+        .filter(|unit| !facts.active_units.iter().any(|active| active == *unit))
+        .map(String::as_str)
+        .collect()
 }
 
 /// Live seat facts, counting pending invite/enrollment bearers from the
@@ -673,8 +700,23 @@ mod tests {
                     !units.iter().any(|unit| unit == FIRSTBOOT_SELF_UNIT),
                     "{role:?} grouped={grouped} must not require the activating oneshot"
                 );
+                assert!(
+                    !units.iter().any(|unit| is_open_onboarding_unit(unit)),
+                    "{role:?} grouped={grouped} must not require dest-gated collab-identity"
+                );
             }
         }
+        let workstation_grouped = runtime_expected_units(Role::Workstation, true);
+        assert!(
+            !workstation_grouped.iter().any(|unit| is_timer_unit(unit)),
+            "workstation grouped first-boot must drop timer leaks: {workstation_grouped:?}"
+        );
+        assert!(!workstation_grouped
+            .iter()
+            .any(|unit| unit == "mackesd.service"));
+        assert!(!workstation_grouped
+            .iter()
+            .any(|unit| unit == "etcd.service"));
     }
 
     #[test]
@@ -689,6 +731,10 @@ mod tests {
         let grouped_lh = runtime_expected_units(Role::Lighthouse, true);
         assert!(!grouped_lh.iter().any(|unit| unit == "mackesd.service"));
         assert!(grouped_lh.iter().any(|unit| unit == "etcd.service"));
+        assert!(
+            grouped_lh.iter().any(|unit| unit == "mesh-health.timer"),
+            "lighthouse grouped plane still enable-masks timers; first-boot only drops them on workstation grouped"
+        );
         for unit in GROUPED_MACKESD_UNITS {
             assert!(
                 grouped_lh.iter().any(|active| active == unit),
@@ -699,12 +745,23 @@ mod tests {
         let workstation = runtime_expected_units(Role::Workstation, true);
         assert!(!workstation.iter().any(|unit| unit == "mackesd.service"));
         assert!(!workstation.iter().any(|unit| unit == "etcd.service"));
+        assert!(
+            !workstation.iter().any(|unit| is_timer_unit(unit)),
+            "workstation grouped plane must drop timer units leaked from units_for_role: {workstation:?}"
+        );
+        assert!(
+            !workstation
+                .iter()
+                .any(|unit| is_open_onboarding_unit(unit)),
+            "workstation grouped plane must not require dest-gated collab-identity: {workstation:?}"
+        );
         for unit in GROUPED_MACKESD_UNITS {
             assert!(
                 workstation.iter().any(|active| active == unit),
                 "grouped workstation first-boot must require {unit}"
             );
         }
+        assert!(workstation.iter().any(|unit| unit == "nebula.service"));
     }
 
     #[test]
@@ -718,6 +775,89 @@ mod tests {
         assert!(
             checks.iter().all(|check| !check.blocks_progress()),
             "active grouped plane must not block first-boot: {checks:?}"
+        );
+    }
+
+    #[test]
+    fn firstboot_grouped_workstation_units_pass_when_collab_identity_is_inactive() {
+        let mut facts = healthy("seat-15");
+        facts.expected_units = runtime_expected_units(Role::Workstation, true);
+        assert!(
+            !facts
+                .expected_units
+                .iter()
+                .any(|unit| unit == "mackesd.service" || unit == "etcd.service"),
+            "workstation grouped expected units leaked monolithic/etcd: {:?}",
+            facts.expected_units
+        );
+        assert!(
+            !facts.expected_units.iter().any(|unit| is_timer_unit(unit)),
+            "workstation grouped expected units leaked timers: {:?}",
+            facts.expected_units
+        );
+        for unit in GROUPED_MACKESD_UNITS {
+            assert!(
+                facts.expected_units.iter().any(|expected| expected == unit),
+                "expected units must include grouped {unit}"
+            );
+        }
+        assert!(facts
+            .expected_units
+            .iter()
+            .any(|unit| unit == "nebula.service"));
+
+        // Hostile leak: dest-gated collab-identity appears in expected_units
+        // as if units_for_role started shipping it. assemble must still pass
+        // the units row while the unit stays inactive/failed.
+        facts.expected_units.push(COLLAB_IDENTITY_UNIT.to_owned());
+        facts.active_units = facts
+            .expected_units
+            .iter()
+            .filter(|unit| !is_open_onboarding_unit(unit))
+            .cloned()
+            .collect();
+        assert!(facts
+            .active_units
+            .iter()
+            .any(|unit| unit == "nebula.service"));
+        for unit in GROUPED_MACKESD_UNITS {
+            assert!(
+                facts.active_units.iter().any(|active| active == unit),
+                "hostile seat must have grouped {unit} active"
+            );
+        }
+        assert!(!facts
+            .active_units
+            .iter()
+            .any(|unit| unit == "mackesd.service"));
+        assert!(!facts.active_units.iter().any(|unit| unit == "etcd.service"));
+        assert!(!facts
+            .active_units
+            .iter()
+            .any(|unit| is_open_onboarding_unit(unit)));
+
+        facts.ui_applicable = true;
+        facts.ui_ready = false;
+        let checks = assemble(&facts);
+        let units = checks
+            .iter()
+            .find(|check| check.check_id == "units")
+            .expect("units row");
+        assert_eq!(
+            units.status,
+            LifecycleCheckStatus::Pass,
+            "grouped plane with inactive collab-identity must not fail units: {}",
+            units.observed
+        );
+        assert!(
+            !units.blocks_progress(),
+            "units must not block first-boot when only dest-gated collab-identity is inactive"
+        );
+        assert!(
+            checks
+                .iter()
+                .any(|check| check.check_id == "verification" && check.blocks_progress()),
+            "verification may still fail for other missing core facts (ui)"
         );
     }
 
