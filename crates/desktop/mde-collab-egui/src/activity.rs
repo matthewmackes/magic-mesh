@@ -2594,6 +2594,11 @@ fn voice_admin_panel(
                 if let Some(notice) = form.notice.as_deref() {
                     widgets::muted_note(ui, notice);
                 }
+                // The closed-state branch returns before the rest of the form
+                // is painted. Persist the notice (in particular the
+                // "Provision published" acknowledgement) so it is not lost
+                // on the next egui frame.
+                store_voice_admin_form_state(ui, form);
                 return;
             }
 
