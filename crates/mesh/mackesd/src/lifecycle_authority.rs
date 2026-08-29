@@ -928,12 +928,10 @@ mod tests {
         .unwrap();
         assert_eq!(saved.progress.completed_steps, 1);
         authority.finish().unwrap();
-        assert!(
-            !root
-                .path()
-                .join("lifecycle/seat-15/lifecycle.lock")
-                .exists()
-        );
+        assert!(!root
+            .path()
+            .join("lifecycle/seat-15/lifecycle.lock")
+            .exists());
     }
 
     #[test]
@@ -1073,12 +1071,10 @@ mod tests {
                 "enrollment bearer template"
             ))
         ));
-        assert!(
-            authority
-                .checkpoint()
-                .pending_enrollment_bearer_digests
-                .is_empty()
-        );
+        assert!(authority
+            .checkpoint()
+            .pending_enrollment_bearer_digests
+            .is_empty());
 
         let bearer = authority
             .mint_lighthouse_enrollment_bearer(root.path(), None)

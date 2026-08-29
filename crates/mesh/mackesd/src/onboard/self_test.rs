@@ -509,7 +509,7 @@ fn role_enable_unit_count(role: Role) -> usize {
 /// ([`probe_role_daemons_active`]) iterate this one source, so the expected set
 /// the classifier compares against and the set the seam probes never drift.
 fn role_enable_units(role: Role) -> impl Iterator<Item = &'static str> {
-    use crate::onboard::role_provision::{UnitAction, plan};
+    use crate::onboard::role_provision::{plan, UnitAction};
     plan(role)
         .into_iter()
         .filter(|u| u.action == UnitAction::Enable)
@@ -979,7 +979,7 @@ mod tests {
     fn role_daemons_expected_count_comes_from_the_reused_model() {
         // The classifier's "expected" is the role_provision plan's enable-units —
         // proving assemble reuses the role→units model rather than a private copy.
-        use crate::onboard::role_provision::{UnitAction, plan};
+        use crate::onboard::role_provision::{plan, UnitAction};
         for role in [Role::Lighthouse, Role::Workstation] {
             let want = plan(role)
                 .iter()

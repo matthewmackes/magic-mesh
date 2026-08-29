@@ -3840,8 +3840,7 @@ fn provision_caddy_if_lighthouse(role: mde_role::Role) {
     let mut command = std::process::Command::new("timeout");
     command.args(["360", "/usr/libexec/mackesd/setup-caddy"]);
     mackesd_core::lifecycle_child_env::strip_lifecycle_child_env(&mut command);
-    match command.status()
-    {
+    match command.status() {
         Ok(s) if s.success() => println!("CONNECT-4: Caddy ingress ready"),
         Ok(s) => eprintln!(
             "provision: setup-caddy exited {:?} — public web ingress deferred; \

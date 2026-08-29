@@ -1260,10 +1260,9 @@ mod tests {
                 media: true,
             })
             .expect_err("media lighthouse promotion must be refused");
-        assert!(
-            err.to_string()
-                .contains("media/file-sharing lighthouse capability is retired")
-        );
+        assert!(err
+            .to_string()
+            .contains("media/file-sharing lighthouse capability is retired"));
         assert!(!tmp.path().join("role.toml").exists());
     }
 
@@ -1468,29 +1467,25 @@ mod tests {
         let now = 1_800_000_000;
         let b = bundle(now);
         let wrong = SigningKey::from_bytes(&[1_u8; 32]);
-        assert!(
-            process_apply(
-                &b,
-                &b.sign(&wrong),
-                &k.verifying_key(),
-                now,
-                &mut guard,
-                &applier
-            )
-            .is_err()
-        );
+        assert!(process_apply(
+            &b,
+            &b.sign(&wrong),
+            &k.verifying_key(),
+            now,
+            &mut guard,
+            &applier
+        )
+        .is_err());
         // same nonce, now correctly signed → still applies (nonce was not burned)
-        assert!(
-            process_apply(
-                &b,
-                &b.sign(&k),
-                &k.verifying_key(),
-                now,
-                &mut guard,
-                &applier
-            )
-            .is_ok()
-        );
+        assert!(process_apply(
+            &b,
+            &b.sign(&k),
+            &k.verifying_key(),
+            now,
+            &mut guard,
+            &applier
+        )
+        .is_ok());
     }
 
     // ── production transports: honest gate + refusal boundaries (§7) ──
@@ -1571,14 +1566,12 @@ mod tests {
         std::fs::write(&known_hosts, "203.0.113.7 ssh-ed25519 AAAA\n").unwrap();
         let args = bootstrap_ssh_argv("203.0.113.7", &key, &known_hosts).unwrap();
         assert_eq!(args.last().map(String::as_str), Some("lighthouse"));
-        assert!(
-            args.windows(2)
-                .any(|pair| pair[0] == "mackesd" && pair[1] == "join")
-        );
-        assert!(
-            args.iter()
-                .any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7")
-        );
+        assert!(args
+            .windows(2)
+            .any(|pair| pair[0] == "mackesd" && pair[1] == "join"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "203.0.113.7" || arg == "root@203.0.113.7"));
         assert!(!args.iter().any(|arg| arg.contains("sh -c")));
         assert!(!args.iter().any(|arg| arg.contains("bearer")));
         assert!(args.iter().any(|arg| arg == "StrictHostKeyChecking=yes"));

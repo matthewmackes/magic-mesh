@@ -70,16 +70,16 @@ use std::io::{self, Read, Write};
 use std::net::{IpAddr, UdpSocket};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mackes_mesh_types::vehicle::{
-    ApprovalState, CellLink, DeviceProbeStatus, FreshnessState, GpsFix, ImuSample, ManagerSet,
-    ManagerSetState, RadioId, RadioInventory, RadioOperation, SnapshotProvenance, SnapshotSource,
-    VEHICLE_ACTION_PREFIX, VEHICLE_STATE_V2_SCHEMA_VERSION, VehicleReply, VehicleState,
-    VehicleStateV2, VehicleTelem, WanStatus, parse_gpgga, vehicle_state_topic,
-    vehicle_state_v2_topic,
+    parse_gpgga, vehicle_state_topic, vehicle_state_v2_topic, ApprovalState, CellLink,
+    DeviceProbeStatus, FreshnessState, GpsFix, ImuSample, ManagerSet, ManagerSetState, RadioId,
+    RadioInventory, RadioOperation, SnapshotProvenance, SnapshotSource, VehicleReply, VehicleState,
+    VehicleStateV2, VehicleTelem, WanStatus, VEHICLE_ACTION_PREFIX,
+    VEHICLE_STATE_V2_SCHEMA_VERSION,
 };
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
@@ -5341,7 +5341,11 @@ fn find_token_after(text: &str, label: &str) -> Option<String> {
     let idx = text.find(label)?;
     let rest = text[idx + label.len()..].trim_start();
     let tok: String = rest.chars().take_while(|c| !c.is_whitespace()).collect();
-    if tok.is_empty() { None } else { Some(tok) }
+    if tok.is_empty() {
+        None
+    } else {
+        Some(tok)
+    }
 }
 
 /// Fold the authenticated LCI MCU ignition-sense row. Unknown or missing values
@@ -5886,18 +5890,14 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(after.esn, before.esn);
         assert_eq!(after.model, before.model);
         assert!((after.telem.battery_v - 13.25).abs() < 0.01);
-        assert!(
-            after
-                .gaps
-                .iter()
-                .any(|gap| gap == "gps/imu unavailable (enrichment timeout)")
-        );
-        assert!(
-            after
-                .gaps
-                .iter()
-                .any(|gap| gap == "wan status unavailable (enrichment timeout)")
-        );
+        assert!(after
+            .gaps
+            .iter()
+            .any(|gap| gap == "gps/imu unavailable (enrichment timeout)"));
+        assert!(after
+            .gaps
+            .iter()
+            .any(|gap| gap == "wan status unavailable (enrichment timeout)"));
         assert_eq!(newer_probe.enrichment_calls(), (0, 0, 0));
     }
 
@@ -5964,25 +5964,19 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             retained.telem.obd_probe_status,
             DeviceProbeStatus::Failed { ref reason } if reason == "application timeout"
         ));
-        assert!(
-            retained
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("gps/imu unavailable") && gap.contains("ssh timeout"))
-        );
-        assert!(
-            retained
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("wan status unavailable") && gap.contains("http timeout"))
-        );
-        assert!(
-            retained
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("OBD application unavailable")
-                    && gap.contains("application timeout"))
-        );
+        assert!(retained
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("gps/imu unavailable") && gap.contains("ssh timeout")));
+        assert!(retained
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("wan status unavailable") && gap.contains("http timeout")));
+        assert!(retained
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("OBD application unavailable")
+                && gap.contains("application timeout")));
     }
 
     #[test]
@@ -6110,13 +6104,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             DeviceProbeStatus::Failed { ref reason }
                 if reason == "connection refused"
         ));
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("OBD application unavailable")
-                    && gap.contains("connection refused"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("OBD application unavailable")
+                && gap.contains("connection refused")));
     }
 
     #[test]
@@ -6185,12 +6177,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.gps.satellites, 7);
         assert!((state.gps.latitude - 35.1234).abs() < 0.0001);
         assert!((state.gps.longitude + 78.4567).abs() < 0.0001);
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("gps/imu unavailable"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("gps/imu unavailable")));
     }
 
     #[test]
@@ -6205,12 +6195,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.gps, baseline.gps);
         assert_eq!(state.telem.battery_v, baseline.telem.battery_v);
         assert_eq!(state.telem.internal_temp_c, baseline.telem.internal_temp_c);
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("vehicleID does not match gateway ESN"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("vehicleID does not match gateway ESN")));
     }
 
     #[test]
@@ -6366,24 +6354,18 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert_eq!(state.gps, baseline.gps);
         assert_eq!(state.telem.battery_v, baseline.telem.battery_v);
         assert_eq!(state.telem.internal_temp_c, baseline.telem.internal_temp_c);
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("satellite count out of range"))
-        );
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("battery voltage out of range"))
-        );
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("internal temperature out of range"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("satellite count out of range")));
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("battery voltage out of range")));
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("internal temperature out of range")));
     }
 
     #[test]
@@ -6397,12 +6379,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!((state.telem.battery_v - 12.60).abs() < 0.01);
         assert!((state.telem.internal_temp_c - 33.89).abs() < 0.01);
         assert!(state.telem.ignition_on);
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("status broadcast invalid JSON"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("status broadcast invalid JSON")));
     }
 
     #[test]
@@ -6429,12 +6409,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
 
         assert!((state.telem.battery_v - 12.60).abs() < 0.01);
         assert!(state.telem.ignition_on);
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|gap| gap.contains("no documented telemetry fields"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|gap| gap.contains("no documented telemetry fields")));
     }
 
     #[test]
@@ -6468,12 +6446,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         assert!(state.online, "the anchor read succeeded ⇒ online");
         assert!(state.imu.is_none());
         assert!(state.gaps.iter().any(|g| g.contains("gps/imu unavailable")));
-        assert!(
-            state
-                .gaps
-                .iter()
-                .any(|g| g.contains("wan status unavailable"))
-        );
+        assert!(state
+            .gaps
+            .iter()
+            .any(|g| g.contains("wan status unavailable")));
         // The general.html data still landed.
         assert_eq!(state.esn, "ND84720078011035");
     }
@@ -6528,7 +6504,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(target_os = "linux")]
     #[test]
     fn root_password_reader_rejects_symlinked_file() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("password");
@@ -6546,7 +6522,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(unix)]
     #[test]
     fn cookie_jar_is_private_exclusive_and_removed_on_drop() {
-        use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, MetadataExt as _, PermissionsExt as _};
 
         let tmp = tempfile::tempdir().unwrap();
         let runtime = tmp.path().join("vehicle-http");
@@ -6580,7 +6556,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(unix)]
     #[test]
     fn cookie_runtime_directory_rejects_symlink() {
-        use std::os::unix::fs::{PermissionsExt as _, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt as _};
 
         let tmp = tempfile::tempdir().unwrap();
         let target = tmp.path().join("real-runtime");
@@ -6709,13 +6685,11 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         .expect("reconnected manager must resume with a new Changed epoch");
 
         tx.send(true).expect("signal shutdown");
-        assert!(
-            tokio::time::timeout(Duration::from_secs(2), handle)
-                .await
-                .expect("worker shutdown")
-                .expect("worker join")
-                .is_ok()
-        );
+        assert!(tokio::time::timeout(Duration::from_secs(2), handle)
+            .await
+            .expect("worker shutdown")
+            .expect("worker join")
+            .is_ok());
     }
 
     #[test]
@@ -6826,11 +6800,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             })
             .collect::<Vec<_>>();
         assert!(states.iter().all(|state| !state.online));
-        assert!(
-            states
-                .iter()
-                .any(|state| state.gaps.iter().any(|gap| gap == "current status pending"))
-        );
+        assert!(states
+            .iter()
+            .any(|state| state.gaps.iter().any(|gap| gap == "current status pending")));
         assert!(states.iter().any(|state| {
             state
                 .gaps
@@ -7080,12 +7052,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 .collect::<Vec<_>>(),
             vec!["mg90-a", "mg90-b"]
         );
-        assert!(
-            roster
-                .take_publications(t0)
-                .iter()
-                .all(|publication| publication.reason == VehiclePublicationReason::Changed)
-        );
+        assert!(roster
+            .take_publications(t0)
+            .iter()
+            .all(|publication| publication.reason == VehiclePublicationReason::Changed));
 
         // A remains delayed. B fails and only releases its enrichment lane;
         // neither outcome is allowed to mutate accepted telemetry.
@@ -7115,11 +7085,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 .collect::<Vec<_>>(),
             vec!["mg90-a", "mg90-b"]
         );
-        assert!(
-            publications
-                .iter()
-                .all(|publication| publication.reason == VehiclePublicationReason::Heartbeat)
-        );
+        assert!(publications
+            .iter()
+            .all(|publication| publication.reason == VehiclePublicationReason::Heartbeat));
         assert_eq!(
             publications[0].snapshot.telem,
             roster_snapshot(&source_a, "manager-a", 100, 100, 1)
@@ -7273,16 +7241,12 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             .register(VehicleRosterSource::remote(source.clone(), "manager-b", plan).unwrap())
             .unwrap();
 
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source, "manager-a", 100, 100, 1))
-                .unwrap()
-        );
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source, "manager-b", 200, 200, 1))
-                .unwrap()
-        );
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-a", 100, 100, 1))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-b", 200, 200, 1))
+            .unwrap());
         match roster.select_latest(&source) {
             VehicleRosterSelection::Selected(snapshot) => {
                 assert_eq!(snapshot.manager_id(), "manager-b");
@@ -7291,21 +7255,15 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
             other => panic!("expected selected source, got {other:?}"),
         }
 
-        assert!(
-            !roster
-                .ingest(roster_snapshot(&source, "manager-b", 150, 150, 99))
-                .unwrap()
-        );
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source, "manager-a", 300, 300, 9))
-                .unwrap()
-        );
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source, "manager-b", 300, 300, 9))
-                .unwrap()
-        );
+        assert!(!roster
+            .ingest(roster_snapshot(&source, "manager-b", 150, 150, 99))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-a", 300, 300, 9))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source, "manager-b", 300, 300, 9))
+            .unwrap());
         match roster.select_latest(&source) {
             VehicleRosterSelection::Selected(snapshot) => {
                 assert_eq!(snapshot.manager_id(), "manager-b");
@@ -7453,26 +7411,18 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
                 .unwrap();
         }
 
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source_a, "manager-a", 200, 200, 4))
-                .unwrap()
-        );
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source_a, "manager-b", 200, 200, 4))
-                .unwrap()
-        );
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source_b, "manager-a", 100, 100, 1))
-                .unwrap()
-        );
-        assert!(
-            roster
-                .ingest(roster_snapshot(&source_b, "manager-c", 300, 300, 1))
-                .unwrap()
-        );
+        assert!(roster
+            .ingest(roster_snapshot(&source_a, "manager-a", 200, 200, 4))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source_a, "manager-b", 200, 200, 4))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source_b, "manager-a", 100, 100, 1))
+            .unwrap());
+        assert!(roster
+            .ingest(roster_snapshot(&source_b, "manager-c", 300, 300, 1))
+            .unwrap());
 
         let selections = roster.select_latest_all();
         assert_eq!(selections.len(), 2);
@@ -7705,26 +7655,21 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let w = worker().with_probe(Arc::new(fake.clone()));
         let listed = w.handle("list-config", "{}");
         assert!(listed.ok);
-        assert!(
-            listed
-                .applied
-                .as_deref()
-                .is_some_and(|body| body.contains("mcu.yaml"))
-        );
+        assert!(listed
+            .applied
+            .as_deref()
+            .is_some_and(|body| body.contains("mcu.yaml")));
         let inspected = w.handle("inspect", "{}");
         assert!(inspected.ok);
-        assert!(
-            inspected
-                .applied
-                .as_deref()
-                .is_some_and(|body| body.contains("SERRRA-TEST"))
-        );
+        assert!(inspected
+            .applied
+            .as_deref()
+            .is_some_and(|body| body.contains("SERRRA-TEST")));
         assert!(fake.ssh_calls().iter().any(|cmd| cmd == "omgconf list"));
-        assert!(
-            fake.ssh_calls()
-                .iter()
-                .any(|cmd| cmd.contains("mackesd-mg90-inspect"))
-        );
+        assert!(fake
+            .ssh_calls()
+            .iter()
+            .any(|cmd| cmd.contains("mackesd-mg90-inspect")));
     }
 
     #[test]
@@ -7775,11 +7720,10 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let reply = w.handle("set-mcu", &body);
         assert!(reply.ok, "gated: {:?} err: {:?}", reply.gated, reply.error);
         assert_eq!(reply.applied.as_deref(), Some("IGNTHRESH=1.5"));
-        assert!(
-            fake.ssh_calls()
-                .iter()
-                .any(|cmd| cmd.contains("mackesd set-mcu IGNTHRESH"))
-        );
+        assert!(fake
+            .ssh_calls()
+            .iter()
+            .any(|cmd| cmd.contains("mackesd set-mcu IGNTHRESH")));
     }
 
     #[test]
@@ -8261,7 +8205,7 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
     #[cfg(unix)]
     #[test]
     fn hostile_privileged_journal_is_rejected_before_reboot() {
-        use std::os::unix::fs::{PermissionsExt, symlink};
+        use std::os::unix::fs::{symlink, PermissionsExt};
 
         let tmp = tempfile::tempdir().unwrap();
         let auth_tmp = tempfile::tempdir().unwrap();
@@ -8395,11 +8339,9 @@ WLE900VX 802.11AC @ MiniCard PCIe WiFi A   WiFi   Disabled";
         let local = worker.build_state(&FakeProbe::real());
         runtime.ingest_local(&worker, &local, now).unwrap();
 
-        assert!(
-            worker
-                .publish_roster_updates(&mut runtime, &local, now)
-                .is_err()
-        );
+        assert!(worker
+            .publish_roster_updates(&mut runtime, &local, now)
+            .is_err());
         assert_eq!(worker.sequence.load(Ordering::Relaxed), 0);
         assert!(runtime.roster.published.is_empty());
 
