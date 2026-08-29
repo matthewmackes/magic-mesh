@@ -61,6 +61,21 @@ pub struct LifecycleCheckpointV1 {
     pub pending_enrollment_bearer_digests: Vec<String>,
 }
 
+impl LifecycleCheckpointV1 {
+    /// Derive readiness solely from authority-owned checks. Shared by the
+    /// locked authority and the read-only peek path so a renderer cannot
+    /// invent a different ready/blocked answer.
+    pub fn readiness(&self) -> Result<SeatReadinessV1, LifecycleAuthorityError> {
+        SeatReadinessV1::from_requirement_checks(
+            self.plan.schema_version,
+            self.plan.target_id.clone(),
+            self.plan.generation,
+            &self.checks,
+        )
+        .map_err(|_| LifecycleAuthorityError::InvalidPlan("readiness"))
+    }
+}
+
 #[derive(Debug)]
 pub enum LifecycleAuthorityError {
     Io(io::Error),
@@ -229,42 +244,78 @@ impl LifecycleAuthority {
         &self.checkpoint
     }
 
+    /// Read a target checkpoint without taking the exclusive mutation lock.
+    /// Renderers use this so a Status/Lifecycle screen cannot stall or steal
+    /// an in-flight authority session.
+    pub fn peek(
+        root: &Path,
+        target_id: &str,
+    ) -> Result<LifecycleCheckpointV1, LifecycleAuthorityError> {
+        if target_id.is_empty() {
+            return Err(LifecycleAuthorityError::TargetMismatch);
+        }
+        let checkpoint: LifecycleCheckpointV1 = serde_json::from_slice(&std::fs::read(
+            root.join("lifecycle").join(target_id).join(CHECKPOINT),
+        )?)?;
+        checkpoint
+            .plan
+            .validate()
+            .map_err(|_| LifecycleAuthorityError::InvalidPlan("plan"))?;
+        checkpoint
+            .progress
+            .validate()
+            .map_err(|_| LifecycleAuthorityError::InvalidPlan("progress"))?;
+        if checkpoint.plan.target_id != target_id || checkpoint.progress.target_id != target_id {
+            return Err(LifecycleAuthorityError::TargetMismatch);
+        }
+        Ok(checkpoint)
+    }
+
+    /// Newest-generation authority checkpoint under `root/lifecycle/*`.
+    /// Missing root or an empty tree is `Ok(None)`, never a fabricated ready
+    /// session.
+    pub fn peek_latest(
+        root: &Path,
+    ) -> Result<Option<LifecycleCheckpointV1>, LifecycleAuthorityError> {
+        let dir = root.join("lifecycle");
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        let mut best: Option<LifecycleCheckpointV1> = None;
+        for entry in entries {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                continue;
+            }
+            let Some(target_id) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let Ok(checkpoint) = Self::peek(root, &target_id) else {
+                continue;
+            };
+            let take = match &best {
+                None => true,
+                Some(prev) => {
+                    checkpoint.progress.generation > prev.progress.generation
+                        || (checkpoint.progress.generation == prev.progress.generation
+                            && checkpoint.plan.request_id > prev.plan.request_id)
+                }
+            };
+            if take {
+                best = Some(checkpoint);
+            }
+        }
+        Ok(best)
+    }
+
     /// Derive readiness solely from authority-owned checks.  A live target or
     /// completed step is not sufficient while a required check is failed or
     /// unknown; warnings remain visible but do not falsely withdraw usable
     /// capability.
     pub fn readiness(&self) -> Result<SeatReadinessV1, LifecycleAuthorityError> {
-        let missing_requirements = self
-            .checkpoint
-            .checks
-            .iter()
-            .filter(|check| check.blocks_progress())
-            .map(|check| check.check_id.clone())
-            .collect::<Vec<_>>();
-        let warnings = self
-            .checkpoint
-            .checks
-            .iter()
-            .filter(|check| {
-                matches!(
-                    check.status,
-                    mackes_mesh_types::lifecycle::LifecycleCheckStatus::Warn
-                )
-            })
-            .filter_map(|check| check.warning.clone())
-            .collect::<Vec<_>>();
-        let readiness = SeatReadinessV1 {
-            schema_version: self.checkpoint.plan.schema_version,
-            target_id: self.checkpoint.plan.target_id.clone(),
-            generation: self.checkpoint.plan.generation,
-            ready: missing_requirements.is_empty(),
-            missing_requirements,
-            warnings,
-        };
-        readiness
-            .validate()
-            .map_err(|_| LifecycleAuthorityError::InvalidPlan("readiness"))?;
-        Ok(readiness)
+        self.checkpoint.readiness()
     }
 
     pub fn record_check(
@@ -1366,6 +1417,46 @@ mod tests {
             LifecyclePhase::Succeeded
         );
         resumed.finish().unwrap();
+    }
+
+    #[test]
+    fn peek_reads_without_taking_the_mutation_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let authority = LifecycleAuthority::begin(root.path(), plan()).unwrap();
+        let peeked = LifecycleAuthority::peek(root.path(), "seat-15").unwrap();
+        assert_eq!(peeked.plan.request_id, "request-1");
+        assert_eq!(peeked.progress.phase, LifecyclePhase::Planned);
+        let latest = LifecycleAuthority::peek_latest(root.path())
+            .unwrap()
+            .expect("begun session is visible to a renderer");
+        assert_eq!(latest.plan.target_id, "seat-15");
+        authority.finish().unwrap();
+        assert!(LifecycleAuthority::peek_latest(root.path())
+            .unwrap()
+            .is_some());
+        assert!(
+            LifecycleAuthority::peek_latest(&root.path().join("missing"))
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn peek_latest_prefers_the_newer_generation() {
+        let root = tempfile::tempdir().unwrap();
+        let first = LifecycleAuthority::begin(root.path(), plan()).unwrap();
+        first.finish().unwrap();
+        let mut newer = plan();
+        newer.request_id = "request-2".into();
+        newer.target_id = "seat-16".into();
+        newer.generation = 2;
+        let second = LifecycleAuthority::begin(root.path(), newer).unwrap();
+        second.finish().unwrap();
+        let latest = LifecycleAuthority::peek_latest(root.path())
+            .unwrap()
+            .expect("two checkpoints");
+        assert_eq!(latest.plan.target_id, "seat-16");
+        assert_eq!(latest.progress.generation, 2);
     }
 
     #[test]

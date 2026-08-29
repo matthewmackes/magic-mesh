@@ -825,6 +825,37 @@ impl LifecycleProgressV1 {
 }
 
 impl SeatReadinessV1 {
+    /// Derive readiness solely from authority-owned checks. Renderers and the
+    /// locked authority share this so a GUI cannot invent a different
+    /// ready/blocked answer than the TUI.
+    pub fn from_requirement_checks(
+        schema_version: u16,
+        target_id: impl Into<String>,
+        generation: u64,
+        checks: &[LifecycleRequirementCheckV1],
+    ) -> Result<Self, LifecycleIntentError> {
+        let missing_requirements = checks
+            .iter()
+            .filter(|check| check.blocks_progress())
+            .map(|check| check.check_id.clone())
+            .collect::<Vec<_>>();
+        let warnings = checks
+            .iter()
+            .filter(|check| matches!(check.status, LifecycleCheckStatus::Warn))
+            .filter_map(|check| check.warning.clone())
+            .collect::<Vec<_>>();
+        let readiness = Self {
+            schema_version,
+            target_id: target_id.into(),
+            generation,
+            ready: missing_requirements.is_empty(),
+            missing_requirements,
+            warnings,
+        };
+        readiness.validate()?;
+        Ok(readiness)
+    }
+
     pub fn validate(&self) -> Result<(), LifecycleIntentError> {
         validate_common(
             self.schema_version,

@@ -478,7 +478,15 @@ const PAGE_INDEX: [PageEntry; 20] = [
         provider: provider_for(Section::MeshSystem),
         label: "Updates & Lifecycle",
         description: "Updates, recovery, reset, and lifecycle state.",
-        keywords: &["updates", "update", "recovery", "reset"],
+        keywords: &[
+            "updates",
+            "update",
+            "recovery",
+            "reset",
+            "onboard",
+            "offboard",
+            "lifecycle",
+        ],
     },
     PageEntry {
         route: "this-node/recovery-reset",

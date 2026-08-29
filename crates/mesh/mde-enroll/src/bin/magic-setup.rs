@@ -29,7 +29,7 @@ use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
 
 use mde_enroll::commissioning_view::JoinTokenView;
-use mde_enroll::setup::{Screen, Wizard};
+use mde_enroll::setup::{refresh_lifecycle_view, Screen, Wizard};
 use mde_enroll::setup_action::{
     add_peer_argv, found_argv, is_active_argv, join_argv, peers_argv, remove_peer_argv,
     run_streaming, self_test_argv, SetupRole,
@@ -129,6 +129,9 @@ fn run(
                 KeyCode::Up | KeyCode::Char('k') => wiz.menu_up(),
                 KeyCode::Down | KeyCode::Char('j') => wiz.menu_down(),
                 KeyCode::Enter => {
+                    if wiz.selected() == mde_enroll::setup::MenuItem::Lifecycle {
+                        let _ = refresh_lifecycle_view(wiz);
+                    }
                     wiz.activate();
                     input.clear();
                     // Status/Manage run immediately on open (read-only).
@@ -170,6 +173,15 @@ fn run(
             },
             Screen::Lifecycle => match key.code {
                 KeyCode::Esc | KeyCode::Char('q') => wiz.back_to_menu(),
+                KeyCode::Char('r') => {
+                    if refresh_lifecycle_view(wiz) {
+                        for line in wiz.lifecycle_lines() {
+                            wiz.push_log(line);
+                        }
+                    } else {
+                        wiz.push_log("no lifecycle session published".to_string());
+                    }
+                }
                 _ => {}
             },
             Screen::Manage if manage_removing => match key.code {
@@ -470,7 +482,7 @@ fn draw(
         Screen::Menu => "↑/↓ (or j/k) move · Enter open · q quit",
         Screen::Create | Screen::Join => "type value · Tab switch role · Enter run · Esc back",
         Screen::Status => "r refresh · Esc back",
-        Screen::Lifecycle => "read-only session · Esc back",
+        Screen::Lifecycle => "read-only session · r refresh · Esc back",
         Screen::Manage if manage_removing => "type node-id · Enter remove · Esc cancel",
         Screen::Manage => {
             "a add peer · l add lighthouse · d remove · Tab role · r refresh · Esc back"

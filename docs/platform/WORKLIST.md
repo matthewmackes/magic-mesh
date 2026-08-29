@@ -7,10 +7,10 @@ tasks.
 
 ## Current Snapshot - 2026-08-19 fully automated production 13.0.0 execution plus feature completion
 
-- **10 active epics:** 9 `Remaining`, 1 `Blocked`, 0 `Needs clarification`.
+- **10 active epics:** 9 `Remaining`, 0 `Blocked`, 1 `Awaiting testing`, 0 `Needs clarification`.
   Operator 2026-08-29: close Remaining source epics one at a time, features
   and services first; do not add extra farm gates. `WL-FUNC-024` through `WL-FUNC-032` archived 2026-08-29. Operator 2026-08-27 moved all live-seat, release-wait, and
-  operator-testing leftovers to `WL-TEST-003` (`Blocked` until a testing
+  operator-testing leftovers to `WL-TEST-003` (`Awaiting testing` until a testing
   Beta is released).
   Operator 2026-08-28 skipped Construct Health Fix: do not fan or wait on a
   DRM Fix click; that leftover executes on `WL-TEST-003` only after the
@@ -186,7 +186,7 @@ already owns. When cargo is fresh at the current clean HEAD, the next act
 is `automation/drain/leftover-units.sh runnable` (source leftovers only
 until a testing Beta exists). Live-seat, release-wait, operator-testing,
 and Construct Health Fix leftovers live on `WL-TEST-003` and are not
-runnable while it is Blocked. Do not stall the drain on a DRM Fix click.
+runnable while it is Awaiting testing. Do not stall the drain on a DRM Fix click.
 `@leftover:{dest-operator}` / `keep` / `release-wait` on Remaining epics do
 not fill slots; they do not authorize invented dests.
 
@@ -1250,7 +1250,7 @@ is a capacity incident (§10.0.3), not a silent retry.
 
 ### WL-TEST-003 - Execute live-seat and operator testing after a testing Beta
 
-- Status: Blocked
+- Status: Awaiting testing
 - Priority: P1
 - Complexity: Epic
 - Problem: live-seat proofs, release-wait leftovers, and operator testing were
@@ -1262,8 +1262,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   `production_admitted`.
 - Current state: Operator 2026-08-27 moved those leftovers here. Dest-cut
   `bc14a22d7` (`13.0.0-35` / LH `13.0.0-11`) is not a testing Beta. This epic
-  stays Blocked until a testing Beta is released. leftover-units ignores
-  Blocked bodies, so drain must not fan live-seat now. Operator 2026-08-28
+  stays Awaiting testing until a testing Beta is released. leftover-units
+  ignores Awaiting testing and Blocked bodies, so drain must not fan
+  live-seat now. Operator 2026-08-28
   skipped Construct Health Fix until that Test Release exists.
 - Remaining work: do not execute until a testing Beta is released. Then:
   1. S1 Live lifecycle leftover from WL-FUNC-023 (Construct Health Fix

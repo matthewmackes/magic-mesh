@@ -5,7 +5,7 @@
 //! queued for the Construct shell to mint, because production arming stays in
 //! the root shell.
 
-use mackes_mesh_types::vehicle::{VehicleReply, vehicle_action_topic};
+use mackes_mesh_types::vehicle::{vehicle_action_topic, VehicleReply};
 use mde_bus::hooks::config::Priority;
 use mde_bus::persist::Persist;
 use mde_bus::rpc::reply_topic;

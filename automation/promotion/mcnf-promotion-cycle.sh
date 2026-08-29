@@ -112,9 +112,10 @@ worklist_marker_count() {
 }
 
 worklist_active_breakdown() {
-  printf 'remaining=%s blocked=%s needs_clarification=%s\n' \
+  printf 'remaining=%s blocked=%s awaiting_testing=%s needs_clarification=%s\n' \
     "$(worklist_marker_count 'Remaining')" \
     "$(worklist_marker_count 'Blocked')" \
+    "$(worklist_marker_count 'Awaiting testing')" \
     "$(worklist_marker_count 'Needs clarification')"
 }
 

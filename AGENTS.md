@@ -158,7 +158,7 @@ authority — this section is the shared operational glue.
   sources*, not parallel trackers — never present a second file as an active
   worklist.
 - Items are `### WL-<FAMILY>-<NNN>` epics with a fixed field set and a `Status` of
-  `Remaining` / `Blocked` / `Needs clarification`. Full lifecycle — ID scheme,
+  `Remaining` / `Blocked` / `Awaiting testing` / `Needs clarification`. Full lifecycle — ID scheme,
   required fields, archive-on-close, evidence-citation, and duplicate-workstream
   avoidance — is the **Stewardship** section of `docs/platform/WORKLIST.md`.
 - Closed/retired items move to `docs/worklist-archive/` with a disposition (see

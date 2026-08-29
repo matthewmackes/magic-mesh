@@ -55,6 +55,7 @@ mod host_mirror;
 mod hotkeys;
 mod iac;
 mod keyboard;
+mod lifecycle_session;
 mod lock_signal;
 mod logging;
 mod mesh_view;

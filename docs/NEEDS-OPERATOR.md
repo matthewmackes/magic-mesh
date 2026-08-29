@@ -19,8 +19,9 @@ archive's role.
 ## Re-key map — old ID → owning WL-\* epic (2026-07-19)
 
 Each row: the old queue ID (left) is now tracked by the WL-\* epic (right). A
-`Status: Blocked` epic is where the operator gate lives; check that epic's
-`- Status:` and acceptance in `WORKLIST.md` for the current state.
+`Status: Blocked` or `Status: Awaiting testing` epic is where the
+operator or testing-wait gate lives; check that epic's `- Status:` and
+acceptance in `WORKLIST.md` for the current state.
 
 | Old queue ID | Owning WL-\* epic | Notes |
 |---|---|---|

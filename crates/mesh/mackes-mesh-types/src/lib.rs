@@ -78,6 +78,8 @@ pub mod lighthouse;
 // facts need a per-lighthouse probe lane (LIGHTHOUSE follow-on, now filled).
 /// WL-FUNC-023 — bounded local ONBOARD & OFFBOARDING intent contract.
 pub mod lifecycle;
+/// WL-FUNC-023 S4 — renderer-neutral lifecycle session projection.
+pub mod lifecycle_view;
 pub mod lighthouse_probe;
 /// WL-FUNC-017 — bounded weather-location preference and effective-location contracts.
 pub mod location;

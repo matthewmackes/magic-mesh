@@ -21,8 +21,9 @@ Verification method, Origin or merged source IDs.
 
 Optional: `Dependencies`. No `Progress` field. No checkbox markers.
 
-Status is exactly `Remaining` / `Blocked` / `Needs clarification`. Do not
-leave a completed epic in the active file.
+Status is exactly `Remaining` / `Blocked` / `Awaiting testing` /
+`Needs clarification`. Testing-wait leftovers use `Awaiting testing`,
+not `Blocked`. Do not leave a completed epic in the active file.
 
 ## Parallel drain unit (required for Remaining)
 
@@ -57,8 +58,9 @@ following a testing Beta). Skip Construct Health Fix until that Test
 Release; do not stall the drain on a DRM Fix click. Do not invent dests.
 Do not treat dest-operator or keep leftovers as farm-idle.
 
-`Status: Blocked` and `Status: Needs clarification` epics may omit the
-payload but should record what would unblock the payload landing.
+`Status: Blocked`, `Status: Awaiting testing`, and
+`Status: Needs clarification` epics may omit the payload but should
+record what would unblock the payload landing.
 
 ## Close and evidence
 
@@ -73,8 +75,9 @@ payload but should record what would unblock the payload landing.
 
 ## Hygiene
 
-Update the snapshot Remaining/Blocked/Needs-clarification counts so they match
-parsed epics. Keep lines and epic bodies inside `lint-worklist.sh` limits.
+Update the snapshot Remaining/Blocked/Awaiting-testing/Needs-clarification
+counts so they match parsed epics. Keep lines and epic bodies inside
+`lint-worklist.sh` limits.
 
 Before landing worklist edits:
 

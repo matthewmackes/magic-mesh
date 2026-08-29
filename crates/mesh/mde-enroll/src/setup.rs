@@ -10,8 +10,11 @@
 //! Lock 1 (one binary grown from `mde-enroll`): the Join screen reuses the
 //! ONBOARD-5 enroll [`crate::app::App`]; `mde-enroll` stays the join-only shim.
 
+use std::path::Path;
+
 use crate::commissioning_view::{CapsuleView, JoinTokenView};
 use crate::lifecycle_view::LifecycleSessionView;
+use mackesd_core::lifecycle_authority::LifecycleAuthority;
 
 /// Which top-level screen the wizard is showing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -240,6 +243,12 @@ impl Wizard {
         self.lifecycle_view = Some(view);
     }
 
+    /// Drop a stale projection so the screen cannot keep showing a session
+    /// after the authority tree is gone.
+    pub fn clear_lifecycle_view(&mut self) {
+        self.lifecycle_view = None;
+    }
+
     /// Honest lifecycle lines for GUI/TUI consumers. Empty session is
     /// named, never implied ready. No mutation verbs.
     #[must_use]
@@ -298,6 +307,45 @@ impl Wizard {
         }
         lines
     }
+}
+
+/// Hydrate the wizard from `root/lifecycle/*/checkpoint.json` without
+/// taking the exclusive authority lock. Returns false when no valid
+/// session is published; the caller then keeps the honest empty line.
+pub fn attach_lifecycle_from_authority_root(wiz: &mut Wizard, root: &Path) -> bool {
+    match LifecycleAuthority::peek_latest(root) {
+        Ok(Some(checkpoint)) => match crate::lifecycle_view::view_from_checkpoint(&checkpoint) {
+            Ok(view) => {
+                wiz.set_lifecycle_view(view);
+                true
+            }
+            Err(_) => false,
+        },
+        Ok(None) | Err(_) => false,
+    }
+}
+
+/// Known local authority roots. Workgroup first (join/found), then the
+/// mackesd state tree. Neither path is a dest and neither is treated as ready
+/// just because the directory exists.
+pub fn default_lifecycle_authority_roots() -> [std::path::PathBuf; 2] {
+    [
+        mackesd_core::default_qnm_shared_root(),
+        std::path::PathBuf::from("/var/lib/mackesd"),
+    ]
+}
+
+/// Attach from the first published root, or clear so a vanished checkpoint
+/// cannot keep a stale ready line on screen.
+pub fn refresh_lifecycle_view(wiz: &mut Wizard) -> bool {
+    let roots = default_lifecycle_authority_roots();
+    for root in &roots {
+        if attach_lifecycle_from_authority_root(wiz, root) {
+            return true;
+        }
+    }
+    wiz.clear_lifecycle_view();
+    false
 }
 
 #[cfg(test)]
@@ -433,6 +481,41 @@ mod tests {
         let lines = w.lifecycle_lines();
         assert_eq!(lines[0], "session-1: onboard (ready)");
         assert!(lines.iter().any(|line| line.contains("capabilities")));
+    }
+
+    #[test]
+    fn lifecycle_screen_hydrates_from_an_authority_checkpoint() {
+        let root = std::env::temp_dir().join(format!(
+            "mcnf-enroll-lifecycle-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("clock")
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).expect("temp root");
+        let authority = LifecycleAuthority::begin(
+            &root,
+            mackes_mesh_types::lifecycle::LifecyclePlanV1 {
+                schema_version: 1,
+                request_id: "request-1".into(),
+                target_id: "seat-15".into(),
+                intent: mackes_mesh_types::lifecycle::LifecycleIntentKind::Onboard,
+                generation: 1,
+                steps: vec!["identity".into(), "verify".into()],
+            },
+        )
+        .expect("begin lifecycle");
+        authority.finish().expect("release lock");
+
+        let mut w = Wizard::new(true);
+        assert!(attach_lifecycle_from_authority_root(&mut w, &root));
+        assert_eq!(w.lifecycle_lines()[0], "request-1: onboard (in progress)");
+        assert!(!attach_lifecycle_from_authority_root(
+            &mut w,
+            &root.join("missing")
+        ));
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     fn create_screen_only_reachable_when_unconfigured() {

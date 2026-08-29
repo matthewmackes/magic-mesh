@@ -3290,6 +3290,11 @@ fn show_section_detail(
                     );
                 }
                 "this-node/updates" => {
+                    let session = crate::lifecycle_session::load_lifecycle_session();
+                    mde_egui::card().show(ui, |ui| {
+                        crate::lifecycle_session::show_lifecycle_session(ui, session.as_ref());
+                    });
+                    ui.add_space(Style::SP_S);
                     mde_egui::card().show(ui, |ui| show_update_posture(ui, status));
                     mde_egui::muted_note(
                         ui,

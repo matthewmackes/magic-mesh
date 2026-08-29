@@ -5941,8 +5941,8 @@ impl EncryptedVaultState {
 mod tests {
     use super::*;
     use mackes_mesh_types::navigation::{
-        ManeuverKind, NAVIGATION_SCHEMA_VERSION, NavigationPhase, NavigationProgress,
-        NavigationSnapshot, RouteAttribution, RouteManeuver, RouteResult,
+        ManeuverKind, NavigationPhase, NavigationProgress, NavigationSnapshot, RouteAttribution,
+        RouteManeuver, RouteResult, NAVIGATION_SCHEMA_VERSION,
     };
     use mackes_mesh_types::nws_alert::GeoPoint;
 
@@ -6160,11 +6160,9 @@ mod tests {
         assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
         assert!(!manager.auto_failover);
         assert!(manager.primary_warning().is_some());
-        assert!(
-            manager
-                .healthy_alternatives()
-                .contains(&LocationSourceKind::UsbGpsd)
-        );
+        assert!(manager
+            .healthy_alternatives()
+            .contains(&LocationSourceKind::UsbGpsd));
         assert_eq!(manager.primary, LocationSourceKind::Mg90Gnss);
     }
 
@@ -6200,11 +6198,9 @@ mod tests {
 
         let warning = manager.primary_warning().expect("status warning");
         assert!(warning.contains("source is unhealthy"));
-        assert!(
-            manager
-                .healthy_alternatives()
-                .contains(&LocationSourceKind::UsbGpsd)
-        );
+        assert!(manager
+            .healthy_alternatives()
+            .contains(&LocationSourceKind::UsbGpsd));
     }
 
     #[test]
@@ -6221,12 +6217,10 @@ mod tests {
             Some("Default state/province region")
         );
         assert_eq!(status.coverage_percent, Some(100));
-        assert!(
-            status
-                .notes
-                .iter()
-                .any(|note| note.contains("Simulator fixture"))
-        );
+        assert!(status
+            .notes
+            .iter()
+            .any(|note| note.contains("Simulator fixture")));
     }
 
     #[test]
@@ -6237,18 +6231,14 @@ mod tests {
         let blocked = state.offline_navigation_status();
         assert_eq!(blocked.readiness, OfflineNavigationReadiness::Blocked);
         assert!(!blocked.can_claim_turn_by_turn());
-        assert!(
-            blocked
-                .blockers
-                .iter()
-                .any(|blocker| blocker.contains("stale"))
-        );
-        assert!(
-            blocked
-                .warnings
-                .iter()
-                .any(|warning| warning.contains("manual switch required"))
-        );
+        assert!(blocked
+            .blockers
+            .iter()
+            .any(|blocker| blocker.contains("stale")));
+        assert!(blocked
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("manual switch required")));
 
         state.locations.set_primary(LocationSourceKind::UsbGpsd);
         let restored = state.offline_navigation_status();
@@ -6264,12 +6254,10 @@ mod tests {
         let status = state.offline_navigation_status();
         assert_eq!(status.readiness, OfflineNavigationReadiness::Blocked);
         assert_eq!(status.loaded_region, None);
-        assert!(
-            status
-                .blockers
-                .iter()
-                .any(|blocker| blocker == "No loaded offline map region is available.")
-        );
+        assert!(status
+            .blockers
+            .iter()
+            .any(|blocker| blocker == "No loaded offline map region is available."));
 
         state.simulate_ready_offline_navigation();
         assert_eq!(
@@ -6285,21 +6273,18 @@ mod tests {
             .setting_change_plan("wan.policy")
             .expect("sample setting exists");
         assert!(plan.backup_required);
-        assert!(
-            plan.steps
-                .iter()
-                .any(|step| step == "Create versioned backup")
-        );
-        assert!(
-            plan.steps
-                .iter()
-                .any(|step| step == "Read back current value")
-        );
-        assert!(
-            plan.steps
-                .iter()
-                .any(|step| step == "Verify direct-Ethernet management path")
-        );
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step == "Create versioned backup"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step == "Read back current value"));
+        assert!(plan
+            .steps
+            .iter()
+            .any(|step| step == "Verify direct-Ethernet management path"));
         assert!(plan.moving_warning);
     }
 
@@ -6413,11 +6398,10 @@ mod tests {
     #[test]
     fn destinations_carry_an_address_for_the_preview_summary() {
         let nav = LocalNavigationState::simulated();
-        assert!(
-            nav.destinations
-                .iter()
-                .all(|destination| !destination.address.trim().is_empty())
-        );
+        assert!(nav
+            .destinations
+            .iter()
+            .all(|destination| !destination.address.trim().is_empty()));
     }
 
     #[test]
@@ -6696,29 +6680,23 @@ mod tests {
             .filter(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX))
             .collect();
         assert_eq!(adapter_notes.len(), MAX_RETAINED_VEHICLE_GAPS);
-        assert!(
-            adapter_notes.iter().all(|note| note.len()
-                <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3)
-        );
-        assert!(
-            state
-                .real_hardware_gaps
-                .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string())
-        );
+        assert!(adapter_notes
+            .iter()
+            .all(|note| note.len()
+                <= VEHICLE_GAP_NOTE_PREFIX.len() + MAX_RETAINED_GAP_TEXT_BYTES + 3));
+        assert!(state
+            .real_hardware_gaps
+            .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
 
         mirror.gaps.clear();
         state.refresh_from_vehicle(&mirror);
-        assert!(
-            !state
-                .real_hardware_gaps
-                .iter()
-                .any(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX))
-        );
-        assert!(
-            !state
-                .real_hardware_gaps
-                .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string())
-        );
+        assert!(!state
+            .real_hardware_gaps
+            .iter()
+            .any(|note| note.starts_with(VEHICLE_GAP_NOTE_PREFIX)));
+        assert!(!state
+            .real_hardware_gaps
+            .contains(&VEHICLE_GAPS_CAPPED_NOTE.to_string()));
     }
 
     #[test]
@@ -6729,17 +6707,15 @@ mod tests {
         let mut state = MapsLocationSurface::simulated();
         state.refresh_from_bus("no-such-node-4c1f9e2a");
         assert!(state.simulator_enabled);
-        assert!(
-            state
-                .real_hardware_gaps
-                .iter()
-                .any(|g| g == SIMULATED_MG90_GAP_NOTE)
-        );
+        assert!(state
+            .real_hardware_gaps
+            .iter()
+            .any(|g| g == SIMULATED_MG90_GAP_NOTE));
     }
 
     #[test]
     fn live_bus_vehicle_mirror_drives_car_readouts_and_glance() {
-        use crate::car_status::{CarStatusItem, live_speed_mph};
+        use crate::car_status::{live_speed_mph, CarStatusItem};
         use mackes_mesh_types::vehicle::{
             CellLink, GpsFix, VehicleState as WireVehicleState, VehicleTelem, WanStatus,
         };
@@ -6951,15 +6927,15 @@ mod tests {
     #[test]
     fn weather_ui_folds_canonical_topics_and_retracts_old_generation() {
         use mackes_mesh_types::location::{
-            EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
-            EffectiveWeatherLocation, WEATHER_LOCATION_SCHEMA_VERSION, WeatherCoverage,
-            WeatherLocationMode, weather_location_state_topic,
+            weather_location_state_topic, EffectiveLocationProvenance, EffectiveLocationSnapshot,
+            EffectiveLocationState, EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
+            WEATHER_LOCATION_SCHEMA_VERSION,
         };
         use mackes_mesh_types::nws_alert::GeoPoint;
         use mackes_mesh_types::weather::{
-            CurrentConditions, CurrentWeatherSnapshot, Temperature, TemperatureUnit,
-            WEATHER_CONTRACT_SCHEMA_VERSION, WeatherAttribution, WeatherAvailability,
-            WeatherConditionKind, WeatherProvider, weather_current_state_topic,
+            weather_current_state_topic, CurrentConditions, CurrentWeatherSnapshot, Temperature,
+            TemperatureUnit, WeatherAttribution, WeatherAvailability, WeatherConditionKind,
+            WeatherProvider, WEATHER_CONTRACT_SCHEMA_VERSION,
         };
 
         let dir = tempfile::tempdir().expect("bus dir");
@@ -7067,12 +7043,12 @@ mod tests {
     fn interactive_weather_viewport_publishes_typed_latest_action() {
         use mackes_mesh_types::location::{
             EffectiveLocationProvenance, EffectiveLocationSnapshot, EffectiveLocationState,
-            EffectiveWeatherLocation, WEATHER_LOCATION_SCHEMA_VERSION, WeatherCoverage,
-            WeatherLocationMode,
+            EffectiveWeatherLocation, WeatherCoverage, WeatherLocationMode,
+            WEATHER_LOCATION_SCHEMA_VERSION,
         };
         use mackes_mesh_types::nws_alert::GeoPoint;
         use mackes_mesh_types::weather::{
-            SetWeatherMapViewportRequest, weather_set_map_viewport_topic,
+            weather_set_map_viewport_topic, SetWeatherMapViewportRequest,
         };
 
         let dir = tempfile::tempdir().expect("bus dir");
@@ -7125,8 +7101,8 @@ mod tests {
     #[test]
     fn manual_weather_selection_publishes_exact_typed_action() {
         use mackes_mesh_types::location::{
-            SetWeatherLocationRequest, WEATHER_SET_LOCATION_TOPIC, WeatherCoverage,
-            WeatherLocationMode,
+            SetWeatherLocationRequest, WeatherCoverage, WeatherLocationMode,
+            WEATHER_SET_LOCATION_TOPIC,
         };
 
         let dir = tempfile::tempdir().expect("bus dir");
@@ -7706,12 +7682,10 @@ mod tests {
         assert!(!state.map.traffic_event_overlay);
         assert!(!state.map.attribution_line().contains("NCDOT"));
         state.map.traffic_event_overlay = true;
-        assert!(
-            state
-                .map
-                .attribution_line()
-                .contains("NCDOT DriveNC / TIMS")
-        );
+        assert!(state
+            .map
+            .attribution_line()
+            .contains("NCDOT DriveNC / TIMS"));
     }
 
     #[test]
@@ -7723,12 +7697,10 @@ mod tests {
         assert!(!state.map.air_quality_overlay);
         assert!(!state.map.attribution_line().contains("US EPA AirNow"));
         state.map.air_quality_overlay = true;
-        assert!(
-            state
-                .map
-                .attribution_line()
-                .contains("US EPA AirNow (preliminary)")
-        );
+        assert!(state
+            .map
+            .attribution_line()
+            .contains("US EPA AirNow (preliminary)"));
     }
 
     // ── WL-UX-007/S1 — production simulator removal ─────────────────────────
@@ -7784,11 +7756,10 @@ mod tests {
         assert!(s.mg90.status.active_cellular_link().is_none());
 
         // The honest gap report leads with the awaiting-mirror note.
-        assert!(
-            s.real_hardware_gaps
-                .iter()
-                .any(|g| g == AWAITING_MIRROR_GAP_NOTE)
-        );
+        assert!(s
+            .real_hardware_gaps
+            .iter()
+            .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
     }
 
     #[test]
@@ -7958,11 +7929,10 @@ mod tests {
         assert!(s.vehicle.telemetry.is_live());
         assert_eq!(s.mg90.status.active_wan, "Cellular A");
         // The awaiting-mirror gap retracts once the mirror is live.
-        assert!(
-            !s.real_hardware_gaps
-                .iter()
-                .any(|g| g == AWAITING_MIRROR_GAP_NOTE)
-        );
+        assert!(!s
+            .real_hardware_gaps
+            .iter()
+            .any(|g| g == AWAITING_MIRROR_GAP_NOTE));
     }
 
     #[test]
@@ -7987,13 +7957,11 @@ mod tests {
 
         let mut state = MapsLocationSurface::live();
         state.refresh_from_vehicle(&mirror);
-        assert!(
-            !state
-                .locations
-                .primary_sample()
-                .expect("MG90 source")
-                .has_fix()
-        );
+        assert!(!state
+            .locations
+            .primary_sample()
+            .expect("MG90 source")
+            .has_fix());
         assert!(state.vehicle.telemetry.is_live());
         assert!(
             state.moving(),
@@ -8008,13 +7976,11 @@ mod tests {
         state.refresh_from_vehicle(&mirror);
         assert!(state.vehicle.telemetry.has_live_gateway_source());
         assert!(!state.vehicle.telemetry.is_live());
-        assert!(
-            state
-                .locations
-                .primary_sample()
-                .expect("MG90 source")
-                .stale()
-        );
+        assert!(state
+            .locations
+            .primary_sample()
+            .expect("MG90 source")
+            .stale());
         assert!(!state.moving(), "stale motion must fail safe to parked");
         assert_eq!(state.vehicle_glance(), None);
     }
@@ -8234,12 +8200,10 @@ mod tests {
         assert_eq!(health.snapshot_age_ms, Some(6_000));
         assert_eq!(health.radios_freshness.state, VehicleFreshnessState::Stale);
         assert_eq!(health.gnss_freshness.state, VehicleFreshnessState::Stale);
-        assert!(
-            health
-                .radios
-                .iter()
-                .all(|row| row.operation == VehicleRadioOperation::Stale)
-        );
+        assert!(health
+            .radios
+            .iter()
+            .all(|row| row.operation == VehicleRadioOperation::Stale));
         assert!(health.radios.iter().all(|row| !row.active_path));
         assert_eq!(health.availability, VehicleRadioAvailability::Degraded);
     }
@@ -8341,12 +8305,10 @@ mod tests {
         surface.refresh_from_vehicle_v2(&snapshot);
         let stale = surface.vehicle_health_rail();
         assert_eq!(stale.state, VehicleHealthRailState::Stale);
-        assert!(
-            stale
-                .slots
-                .iter()
-                .all(|slot| slot.state == VehicleHealthRailState::Stale)
-        );
+        assert!(stale
+            .slots
+            .iter()
+            .all(|slot| slot.state == VehicleHealthRailState::Stale));
 
         let resyncing = surface
             .vehicle_mirror_status
@@ -8354,12 +8316,10 @@ mod tests {
         surface.set_vehicle_mirror_status(resyncing);
         let resync = surface.vehicle_health_rail();
         assert_eq!(resync.state, VehicleHealthRailState::Resyncing);
-        assert!(
-            resync
-                .slots
-                .iter()
-                .all(|slot| slot.state == VehicleHealthRailState::Resyncing)
-        );
+        assert!(resync
+            .slots
+            .iter()
+            .all(|slot| slot.state == VehicleHealthRailState::Resyncing));
         assert!(resync.slots.iter().all(|slot| slot.presence.is_some()));
     }
 
@@ -8672,18 +8632,14 @@ mod tests {
 
         let readiness = s.navigation_start_readiness();
         assert!(!readiness.can_start());
-        assert!(
-            readiness
-                .blockers()
-                .iter()
-                .any(|reason| reason.contains("verified geographic coordinates"))
-        );
-        assert!(
-            readiness
-                .blockers()
-                .iter()
-                .any(|reason| reason.contains("verified GPS fix"))
-        );
+        assert!(readiness
+            .blockers()
+            .iter()
+            .any(|reason| reason.contains("verified geographic coordinates")));
+        assert!(readiness
+            .blockers()
+            .iter()
+            .any(|reason| reason.contains("verified GPS fix")));
     }
 
     #[test]

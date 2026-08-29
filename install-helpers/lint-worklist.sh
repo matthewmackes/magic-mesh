@@ -105,6 +105,13 @@ structure_check() {
       } else {
         fail(FNR ": snapshot is missing Blocked count")
       }
+      if (match($0, /[0-9]+ `Awaiting testing`/)) {
+        value = substr($0, RSTART, RLENGTH)
+        sub(/ .*/, "", value)
+        snapshot_awaiting = value + 0
+      } else {
+        fail(FNR ": snapshot is missing Awaiting testing count")
+      }
       if (match($0, /[0-9]+ `Needs clarification`/)) {
         value = substr($0, RSTART, RLENGTH)
         sub(/ .*/, "", value)
@@ -192,6 +199,7 @@ structure_check() {
         item_status = trim(item_status)
         if (item_status != "Remaining" &&
             item_status != "Blocked" &&
+            item_status != "Awaiting testing" &&
             item_status != "Needs clarification") {
           fail(FNR ": invalid active status for " item_id ": " item_status)
         } else if (field_seen[key] == 1) {
@@ -234,16 +242,21 @@ structure_check() {
           fail("snapshot Blocked=" snapshot_blocked \
             " but parsed Blocked=" status_count["Blocked"] + 0)
         }
+        if (snapshot_awaiting != status_count["Awaiting testing"] + 0) {
+          fail("snapshot Awaiting testing=" snapshot_awaiting \
+            " but parsed Awaiting testing=" status_count["Awaiting testing"] + 0)
+        }
         if (snapshot_needs != status_count["Needs clarification"] + 0) {
           fail("snapshot Needs clarification=" snapshot_needs \
             " but parsed Needs clarification=" \
             status_count["Needs clarification"] + 0)
         }
       }
-      printf "lint-worklist.sh: items=%d remaining=%d blocked=%d needs_clarification=%d\n",
+      printf "lint-worklist.sh: items=%d remaining=%d blocked=%d awaiting_testing=%d needs_clarification=%d\n",
         items,
         status_count["Remaining"] + 0,
         status_count["Blocked"] + 0,
+        status_count["Awaiting testing"] + 0,
         status_count["Needs clarification"] + 0
       exit failed ? 1 : 0
     }
@@ -318,8 +331,9 @@ farm_parser_check() {
 # one real `@farm:{cargo …}` payload so the DRAIN-ENGINE
 # (drain-coordinator + farm-reconciler + farm-agent) has a machine-readable
 # unit to schedule. A missing payload silently idles free farm slots even
-# though 10 heavy build slots exist. Blocked / Needs clarification epics are
-# exempt (they park until an operator input lifts them).
+# though 10 heavy build slots exist. Blocked / Awaiting testing /
+# Needs clarification epics are exempt (they park until an operator
+# or testing-wait input lifts them).
 farm_remaining_unit_check() {
   local wl="$1"
   awk '
@@ -405,7 +419,7 @@ self_test() {
     local path="$1" farm_line="${2:-}"
     {
       printf '%s\n' '# Platform Worklist'
-      printf '%s\n' '- **2 active epics:** 1 `Remaining`, 1 `Blocked`, 0 `Needs clarification`.'
+      printf '%s\n' '- **2 active epics:** 1 `Remaining`, 1 `Blocked`, 0 `Awaiting testing`, 0 `Needs clarification`.'
       printf '%s\n' '### WL-TEST-001 - Good remaining item'
       printf '%s\n' '- Status: Remaining'
       printf '%s\n' '- Priority: P1'

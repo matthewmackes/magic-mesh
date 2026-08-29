@@ -9,7 +9,7 @@
 #     - Verification method: @farm:{cargo build -p mde-bus}
 # The text inside @farm:{ … } is the exact command run on a build VM. A task may
 # carry more than one. Status comes from the reconciled worklist status:
-#     Remaining -> open; Blocked / Needs clarification -> blocked
+#     Remaining -> open; Blocked / Awaiting testing / Needs clarification -> blocked
 # Only OPEN tasks yield ACTIVE jobs (blocked/clarification-needed are skipped).
 # The parser also understands the retired checkbox format used by old fixtures:
 #     [ ] open · [>] in-progress · [✓] done · [!] blocked.
@@ -64,10 +64,10 @@ parse() {
       status="?"
     fi
     # Reconciled status line. Remaining is the only unblocked/runnable state.
-    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]Status:[[:space:]]*(Remaining|Blocked|Needs[[:space:]]clarification)[[:space:]]*$ ]]; then
+    if [[ "$line" =~ ^[[:space:]]*-[[:space:]]Status:[[:space:]]*(Remaining|Blocked|Awaiting[[:space:]]testing|Needs[[:space:]]clarification)[[:space:]]*$ ]]; then
       case "${BASH_REMATCH[1]}" in
         Remaining) status="open" ;;
-        Blocked|Needs*) status="blocked" ;;
+        Blocked|Awaiting*|Needs*) status="blocked" ;;
         *) status="?" ;;
       esac
     fi
@@ -130,16 +130,21 @@ self_test() {
     printf '%s\n' '### WL-CRIT-004 - Blocked job'
     printf '%s\n' '- Status: Blocked'
     printf '%s\n' '- Verification method: @farm:{cargo test -p mackesd}'
+    printf '%s\n' '### WL-TEST-003 - Awaiting testing job'
+    printf '%s\n' '- Status: Awaiting testing'
+    printf '%s\n' '- Verification method: @farm:{cargo test -p mde-shell-egui}'
     printf '%s\n' '### WL-DOC-001 - Placeholder'
     printf '%s\n' '- Status: Remaining'
     printf '%s\n' '- Verification method: @farm:{crate,verify}'
   } >"$wl"
   check "new worklist active job count → 1" \
     "$(MCNF_WORKLIST="$wl" "$0" active | wc -l | tr -d ' ')" 1
-  check "new worklist list job count → 2" \
-    "$(MCNF_WORKLIST="$wl" "$0" list | wc -l | tr -d ' ')" 2
+  check "new worklist list job count → 3" \
+    "$(MCNF_WORKLIST="$wl" "$0" list | wc -l | tr -d ' ')" 3
   check "new worklist task id preserved" \
     "$(MCNF_WORKLIST="$wl" "$0" active | awk -F'\t' 'NR==1 { print $3 }')" WL-BUILD-002
+  check "awaiting testing is not active" \
+    "$(MCNF_WORKLIST="$wl" "$0" list | awk -F'\t' '$3=="WL-TEST-003" { print $2 }')" blocked
   if [ "$fails" -eq 0 ]; then echo "farm-jobs: self-test passed"; return 0; fi
   echo "farm-jobs: SELF-TEST FAILED ($fails)" >&2; return 1
 }

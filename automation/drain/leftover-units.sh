@@ -79,7 +79,7 @@ for line in text:
         status = None
         body = []
         continue
-    sm = re.match(r"^\s*-\s*Status:\s*(Remaining|Blocked|Needs clarification)\s*$", line)
+    sm = re.match(r"^\s*-\s*Status:\s*(Remaining|Blocked|Awaiting testing|Needs clarification)\s*$", line)
     if sm and epic:
         status = sm.group(1)
         body.append(line)
@@ -96,7 +96,7 @@ self_test() {
   trap 'rm -rf "$td"' RETURN
   cat >"$td/WORKLIST.md" <<'EOF'
 # Platform Worklist
-- **2 active epics:** 2 `Remaining`, 0 `Blocked`, 0 `Needs clarification`.
+- **3 active epics:** 2 `Remaining`, 0 `Blocked`, 1 `Awaiting testing`, 0 `Needs clarification`.
 
 ### WL-FUNC-025 - Files
 - Status: Remaining
@@ -111,6 +111,10 @@ self_test() {
 ### WL-FUNC-099 - Closed-looking
 - Status: Blocked
 - Remaining work: ignore. @leftover:{live-seat}
+
+### WL-TEST-003 - Testing wait
+- Status: Awaiting testing
+- Remaining work: ignore. @leftover:{live-seat}
 EOF
   echo "leftover-units --self-test:"
   local out
@@ -118,6 +122,7 @@ EOF
   echo "$out" | grep -qx 'WL-FUNC-025	live-seat' || { echo "  FAIL: live-seat row" >&2; fails=$((fails+1)); }
   echo "$out" | grep -qx 'WL-REL-006	dest-operator' || { echo "  FAIL: dest-operator row" >&2; fails=$((fails+1)); }
   echo "$out" | grep -q 'WL-FUNC-099' && { echo "  FAIL: blocked epic leaked" >&2; fails=$((fails+1)); }
+  echo "$out" | grep -q 'WL-TEST-003' && { echo "  FAIL: awaiting-testing epic leaked" >&2; fails=$((fails+1)); }
   out="$(MCNF_WORKLIST="$td/WORKLIST.md" "$0" runnable)"
   echo "$out" | grep -q dest-operator && { echo "  FAIL: dest-operator in runnable" >&2; fails=$((fails+1)); }
   echo "$out" | grep -qx 'WL-FUNC-025	live-seat' || { echo "  FAIL: runnable live-seat" >&2; fails=$((fails+1)); }
