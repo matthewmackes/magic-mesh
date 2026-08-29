@@ -830,6 +830,15 @@ impl EditorSurface {
         }
     }
 
+    /// Place a single selection at char indices `anchor` and `head` (both
+    /// clamped), dropping any other carets. Embedding surfaces use this when
+    /// restoring a collab presence selection after a remote text apply.
+    pub fn place_selection(&mut self, anchor: usize, head: usize) {
+        if let Some(doc) = self.doc_mut() {
+            doc.view.place_selection(&doc.buffer, anchor, head);
+        }
+    }
+
     /// Replay a collab follow-mode presence update onto the focused editor view.
     pub fn apply_follow_update(&mut self, update: &crate::FollowUpdate) -> bool {
         let Some(doc) = self.doc_mut() else {

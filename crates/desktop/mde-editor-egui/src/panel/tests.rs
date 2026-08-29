@@ -176,6 +176,21 @@ fn replace_text_clamps_caret_when_the_buffer_shrinks() {
     );
 }
 
+#[test]
+fn replace_text_preserves_a_unicode_selection_across_remote_apply() {
+    let mut surface = real_editor();
+    surface.open_text("one 🙂 two");
+    surface.place_selection(4, 6);
+    surface.replace_text("one 🙂 and two");
+
+    assert_eq!(
+        surface.current_cursor(),
+        Some(crate::CursorPos { anchor: 4, head: 6 }),
+        "remote text application must preserve the char-index selection"
+    );
+    assert_eq!(surface.current_text().as_deref(), Some("one 🙂 and two"));
+}
+
 /// EDITOR-10 — the integrated terminal dock is reachable through the real
 /// `editor_panel` path: the Ctrl+Backtick chord toggles it on, it spawns a real PTY
 /// in the open project root, the panel mounts + paints with it shown, and the

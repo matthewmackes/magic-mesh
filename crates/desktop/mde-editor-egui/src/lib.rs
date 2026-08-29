@@ -89,7 +89,8 @@
 //!   Nebula (which is also what the shell's Mesh Map watches to badge nodes in
 //!   active co-editing sessions). Real convergence is proven over a transport
 //!   seam ([`collab_session::CollabTransport`]) with an in-process fake bus; the
-//!   panel wiring + live smoke are the remaining share-session UI unit.
+//!   Documents mode owns the panel wiring, while live two-seat smoke remains
+//!   operator evidence rather than a fixture claim.
 //!
 //! * EDITOR-6 — **tabs + splittable panes** ([`panes`]): the surface grows from
 //!   one open document into a pane registry (each pane a strip of open-buffer
