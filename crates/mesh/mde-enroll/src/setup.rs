@@ -31,6 +31,9 @@ pub enum Screen {
     Manage,
     /// Status + services (SETUP-5).
     Status,
+    /// Shared ONBOARD/OFFBOARD session projection (WL-FUNC-023 S4).
+    /// Read-only; both TUI and GUI consume [`LifecycleSessionView`].
+    Lifecycle,
 }
 
 /// A selectable top-menu entry. The set shown depends on whether the node
@@ -92,7 +95,7 @@ impl MenuItem {
             MenuItem::JoinMesh => Some(Screen::Join),
             MenuItem::ManagePeers => Some(Screen::Manage),
             MenuItem::Status => Some(Screen::Status),
-            MenuItem::Lifecycle => Some(Screen::Status),
+            MenuItem::Lifecycle => Some(Screen::Lifecycle),
             MenuItem::Quit => None,
         }
     }
@@ -202,6 +205,11 @@ impl Wizard {
             Some(screen) => {
                 self.screen = screen;
                 self.push_log(format!("→ {}", self.selected().label()));
+                if screen == Screen::Lifecycle {
+                    for line in self.lifecycle_lines() {
+                        self.push_log(line);
+                    }
+                }
             }
             None => self.should_quit = true,
         }
@@ -230,6 +238,22 @@ impl Wizard {
     /// lifecycle mutation capability.
     pub fn set_lifecycle_view(&mut self, view: LifecycleSessionView) {
         self.lifecycle_view = Some(view);
+    }
+
+    /// Honest lifecycle lines for GUI/TUI consumers. Empty session is
+    /// named, never implied ready. No mutation verbs.
+    #[must_use]
+    pub fn lifecycle_lines(&self) -> Vec<String> {
+        match &self.lifecycle_view {
+            Some(view) => {
+                let mut lines = vec![view.status_line(), view.capability_summary()];
+                if !view.missing_requirements.is_empty() {
+                    lines.push(format!("missing: {}", view.missing_requirements.join(", ")));
+                }
+                lines
+            }
+            None => vec!["no lifecycle session published".to_owned()],
+        }
     }
 
     /// Attach a renderer-safe join-token projection. The wizard never stores
@@ -380,6 +404,37 @@ mod tests {
     }
 
     #[test]
+    fn lifecycle_menu_opens_the_shared_session_screen_not_status() {
+        let mut w = Wizard::new(true);
+        w.menu_index = w
+            .menu_items
+            .iter()
+            .position(|item| *item == MenuItem::Lifecycle)
+            .expect("configured menu includes Lifecycle");
+        w.activate();
+        assert_eq!(w.screen, Screen::Lifecycle);
+        assert_ne!(w.screen, Screen::Status);
+        assert_eq!(
+            w.lifecycle_lines(),
+            vec!["no lifecycle session published".to_owned()]
+        );
+
+        let session = serde_json::json!({
+            "schema_version": 1, "session_id": "session-1", "operator_id": "operator-1",
+            "intent": "onboard", "target_ids": ["seat-15"], "generation": 1, "phase": "succeeded"
+        });
+        let readiness = serde_json::json!({
+            "schema_version": 1, "target_id": "seat-15", "generation": 1,
+            "ready": true, "missing_requirements": [], "warnings": []
+        });
+        w.set_lifecycle_view(
+            LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap(),
+        );
+        let lines = w.lifecycle_lines();
+        assert_eq!(lines[0], "session-1: onboard (ready)");
+        assert!(lines.iter().any(|line| line.contains("capabilities")));
+    }
+
     fn create_screen_only_reachable_when_unconfigured() {
         // A configured node has no CreateMesh entry — you can't re-found.
         let w = Wizard::new(true);

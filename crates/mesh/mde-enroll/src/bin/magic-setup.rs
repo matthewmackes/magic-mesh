@@ -168,6 +168,10 @@ fn run(
                 KeyCode::Char('r') => run_status(wiz),
                 _ => {}
             },
+            Screen::Lifecycle => match key.code {
+                KeyCode::Esc | KeyCode::Char('q') => wiz.back_to_menu(),
+                _ => {}
+            },
             Screen::Manage if manage_removing => match key.code {
                 KeyCode::Esc => {
                     manage_removing = false;
@@ -466,6 +470,7 @@ fn draw(
         Screen::Menu => "↑/↓ (or j/k) move · Enter open · q quit",
         Screen::Create | Screen::Join => "type value · Tab switch role · Enter run · Esc back",
         Screen::Status => "r refresh · Esc back",
+        Screen::Lifecycle => "read-only session · Esc back",
         Screen::Manage if manage_removing => "type node-id · Enter remove · Esc cancel",
         Screen::Manage => {
             "a add peer · l add lighthouse · d remove · Tab role · r refresh · Esc back"
@@ -603,6 +608,7 @@ fn draw_screen(
     } else {
         let (title, hint) = match wiz.screen {
             Screen::Status => ("Status & services", "press r to refresh".to_string()),
+            Screen::Lifecycle => ("Lifecycle session", wiz.lifecycle_lines().join(" · ")),
             Screen::Manage => (
                 "Peers & lighthouses",
                 format!(
