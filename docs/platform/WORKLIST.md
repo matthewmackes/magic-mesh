@@ -244,13 +244,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   qualify, publish, read back, and archive production
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
-- Current state: `WL-FUNC-023` archived 2026-08-30. S1 contracts landed
-  (`ReleaseIntentV1`/`ReleaseStateV1`; unadmitted drafts only).
-  WL-REL-006 dest-operator leftovers stay parked. Unpublished
-  `13.0.0-35` is dest-cut, not a testing Beta. Do not invent dests or
-  flip `production_admitted`. Do not grind `cargo test --workspace`.
-  Evidence: `WL-REL-007-2026-08-30-release-intent-r1.md`. Exact
-  acceptance is Dell, Seat 15, Surface, and three lighthouses.
+- Current state: `WL-FUNC-023` archived 2026-08-30. S1 contracts and S4
+  Android deferral projection landed. S3 / REL-006 dest-operator leftovers
+  stay parked. Unpublished `13.0.0-35` is dest-cut, not a testing Beta.
+  Do not invent dests or flip `production_admitted`. Evidence:
+  `WL-REL-007-2026-08-30-android-deferred-r1.md`. Exact acceptance is
+  Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      Complete: `automation/promotion/release-intent.py` validates
@@ -286,17 +285,11 @@ is a capacity incident (§10.0.3), not a silent retry.
      - Done when: `release-input-preflight.sh` accepts every real production
        input and no preview fixture or historical receipt is admitted.
   4. S4 Apply the Android/Cuttlefish deferral across release contracts.
-     - Inputs: the Android deferral lock, durable governance, release schemas,
-       role collectors, preflight, CI, GUI/TUI capability projections, and docs.
-     - Action: synchronize every live source and policy surface to the six-role
-       `13.0.0` set; reject Android inputs for this version and render the
-       capability visibly `Deferred` without building or provisioning it.
-     - Deliverable: governance/schema migration, six-role producer/verifier
-       contracts, and renderer-neutral deferred-capability state.
-     - Validation: source scans and hostile fixtures reject stale seven-role or
-       required-Cuttlefish assumptions while preserving historical evidence.
-     - Done when: no `13.0.0` gate, helper, role, or UI readiness result requires
-       Android bytes, infrastructure, credentials, or live proof.
+     Complete: preflight/inventory already refuse Android inputs. Shared
+     lifecycle view now projects `android: Deferred` and does not treat
+     android/cuttlefish warnings as a readiness gate. Evidence:
+     `WL-REL-007-2026-08-30-android-deferred-r1.md`. Do not launch or
+     provision Android for `13.0.0`.
   5. S5 Freeze source and cut the six-role candidate.
      - Inputs: completed lifecycle and input epics, the clean pushed candidate
        revision used by S3, protected `master`, required GitHub checks,

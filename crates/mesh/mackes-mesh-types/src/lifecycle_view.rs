@@ -14,6 +14,9 @@ use crate::lifecycle::{
 /// The projection derives the capability name from the *typed* warning so a
 /// renderer never re-parses the raw readiness envelope.
 const CAPABILITY_UNAVAILABLE_PREFIX: &str = "capability unavailable: ";
+/// WL-REL-007 S4: Android/Cuttlefish is deferred for 13.0.0 and must stay
+/// visible without becoming a readiness gate or unavailable capability.
+const ANDROID_DEFERRED_SUMMARY: &str = "android: Deferred";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LifecycleSessionView {
@@ -75,12 +78,25 @@ impl LifecycleSessionView {
     /// capability; a warning that merely mentions the phrase mid-sentence is
     /// left as an ordinary warning. The trailing name is trimmed and empties
     /// are dropped so a renderer receives a clean capability list.
+    fn is_deferred_13_0_0_guest(name: &str) -> bool {
+        let lowered = name.to_ascii_lowercase();
+        lowered.contains("android") || lowered.contains("cuttlefish")
+    }
+
+    fn is_deferred_guest_warning(warning: &str) -> bool {
+        warning
+            .strip_prefix(CAPABILITY_UNAVAILABLE_PREFIX)
+            .map(str::trim)
+            .is_some_and(Self::is_deferred_13_0_0_guest)
+    }
+
     fn capabilities_from_warnings(warnings: &[String]) -> Vec<String> {
         warnings
             .iter()
             .filter_map(|warning| warning.strip_prefix(CAPABILITY_UNAVAILABLE_PREFIX))
             .map(str::trim)
             .filter(|name| !name.is_empty())
+            .filter(|name| !Self::is_deferred_13_0_0_guest(name))
             .map(str::to_owned)
             .collect()
     }
@@ -106,9 +122,13 @@ impl LifecycleSessionView {
         if readiness_wire.generation != session.generation {
             return Err("readiness generation does not match session".to_owned());
         }
+        let production_warnings = readiness_wire
+            .warnings
+            .iter()
+            .any(|warning| !Self::is_deferred_guest_warning(warning));
         let readiness = if !readiness_wire.missing_requirements.is_empty() {
             ReadinessState::Blocked
-        } else if !readiness_wire.warnings.is_empty() {
+        } else if production_warnings {
             ReadinessState::ReadyWithWarnings
         } else {
             ReadinessState::Ready
@@ -384,11 +404,12 @@ impl LifecycleSessionView {
     }
 
     pub fn capability_summary(&self) -> String {
-        if self.capabilities.is_empty() {
+        let baseline = if self.capabilities.is_empty() {
             "capabilities: baseline available".to_owned()
         } else {
             format!("capabilities unavailable: {}", self.capabilities.join(", "))
-        }
+        };
+        format!("{baseline}; {ANDROID_DEFERRED_SUMMARY}")
     }
 
     /// Typed fleet phrase the authority will require. Renderers display it;
@@ -576,7 +597,7 @@ mod tests {
         assert_eq!(pretty_view.capabilities, vec!["kvm", "gpu passthrough"]);
         assert_eq!(
             pretty_view.capability_summary(),
-            "capabilities unavailable: kvm, gpu passthrough"
+            "capabilities unavailable: kvm, gpu passthrough; android: Deferred"
         );
     }
 
@@ -596,7 +617,7 @@ mod tests {
         assert!(view.capabilities.is_empty());
         assert_eq!(
             view.capability_summary(),
-            "capabilities: baseline available"
+            "capabilities: baseline available; android: Deferred"
         );
         assert_eq!(view.readiness, ReadinessState::ReadyWithWarnings);
     }
@@ -619,7 +640,35 @@ mod tests {
         let view =
             LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
         assert_eq!(view.capabilities, vec!["kvm"]);
-        assert_eq!(view.capability_summary(), "capabilities unavailable: kvm");
+        assert_eq!(
+            view.capability_summary(),
+            "capabilities unavailable: kvm; android: Deferred"
+        );
+    }
+
+    #[test]
+    fn android_and_cuttlefish_are_deferred_and_non_gating() {
+        let session = serde_json::json!({
+            "schema_version": 1, "session_id": "session-1", "operator_id": "operator-1",
+            "intent": "verify_and_correct", "target_ids": ["seat-15"], "generation": 1, "phase": "succeeded"
+        });
+        let readiness = serde_json::json!({
+            "schema_version": 1, "target_id": "seat-15", "generation": 1,
+            "ready": true, "missing_requirements": [],
+            "warnings": [
+                "capability unavailable: android",
+                "capability unavailable: cuttlefish"
+            ]
+        });
+        let view =
+            LifecycleSessionView::from_wire(&session.to_string(), &readiness.to_string()).unwrap();
+        assert!(view.capabilities.is_empty());
+        assert_eq!(view.readiness, ReadinessState::Ready);
+        assert_eq!(
+            view.capability_summary(),
+            "capabilities: baseline available; android: Deferred"
+        );
+        assert!(!view.capability_summary().contains("unavailable: android"));
     }
 
     #[test]
