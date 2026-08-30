@@ -2247,6 +2247,52 @@ mod tests {
     }
 
     #[test]
+    fn readiness_status_lines_drop_the_capsule_after_confirm() {
+        let root = tempfile::tempdir().unwrap();
+        let mut authority = LifecycleAuthority::begin(
+            root.path(),
+            LifecyclePlanV1 {
+                schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
+                request_id: "request-capsule-confirm".into(),
+                target_id: "seat-15".into(),
+                intent: LifecycleIntentKind::Onboard,
+                generation: 1,
+                steps: vec!["identity".into(), "verify".into()],
+            },
+        )
+        .unwrap();
+        let signing = SigningKey::from_bytes(&[8u8; 32]);
+        let capsule = CommissioningCapsuleV1 {
+            schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
+            capsule_id: "cap-gone".into(),
+            target_id: "seat-15".into(),
+            expires_at_ms: 2_000,
+            bootstrap_digest_hex: "cd".repeat(32),
+            one_time: true,
+            key_id: "commissioning-v1".into(),
+            signature_hex: String::new(),
+        }
+        .sign("commissioning-v1", &signing);
+        authority
+            .admit_commissioning_capsule(capsule, 1_000, &signing.verifying_key())
+            .unwrap();
+        authority.confirm_commissioning_capsule("cap-gone").unwrap();
+        authority.finish().unwrap();
+        let held = LifecycleAuthority::resume(root.path(), "seat-15").unwrap();
+        let peeked = LifecycleAuthority::peek(root.path(), "seat-15").unwrap();
+        let lines = readiness_status_lines(root.path(), &peeked);
+        assert!(
+            lines.iter().all(|line| !line.contains("capsule cap-gone")),
+            "confirm must erase the staged capsule line: {lines:?}"
+        );
+        assert!(
+            peek_staged_capsule_id(root.path(), "seat-15").is_none(),
+            "confirmed capsule bytes must not remain staged"
+        );
+        held.finish().unwrap();
+    }
+
+    #[test]
     fn doctor_fleet_lifecycle_lines_name_the_staged_package_on_a_single_seat() {
         let root = tempfile::tempdir().unwrap();
         let authority = LifecycleAuthority::begin(
