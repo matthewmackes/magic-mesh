@@ -3722,6 +3722,11 @@ fn show_unavailable_page(ui: &mut egui::Ui, page: PageEntry) {
 }
 
 fn show_recovery_reset_boundary(ui: &mut egui::Ui) {
+    let session = crate::lifecycle_session::load_lifecycle_session();
+    mde_egui::card().show(ui, |ui| {
+        crate::lifecycle_session::show_lifecycle_session(ui, session.as_ref());
+    });
+    ui.add_space(Style::SP_S);
     mde_egui::card().show(ui, |ui| {
         ui.label(RichText::new("Recovery & Reset provider").strong());
         ui.colored_label(Style::WARN, "Provider unavailable");

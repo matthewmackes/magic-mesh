@@ -162,6 +162,8 @@ pub mod lifecycle;
 pub mod lifecycle_authority;
 /// Leftover (2): dest identity env stays off lifecycle grandchildren.
 pub mod lifecycle_child_env;
+/// WL-FUNC-023 — declared-step executor behind the lifecycle authority.
+pub mod lifecycle_step;
 pub mod mesh_init;
 pub mod mirrors;
 pub mod surface;

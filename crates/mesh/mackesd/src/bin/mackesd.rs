@@ -1621,6 +1621,82 @@ enum OnboardCmd {
         #[arg(long)]
         report_only: bool,
     },
+    /// WL-FUNC-023 — walk an already-admitted fleet upgrade. Dest RPM/bootc
+    /// install is not implied; missing bytes fail closed.
+    #[command(name = "lifecycle-fleet-upgrade")]
+    LifecycleFleetUpgrade {
+        #[arg(long = "target-id", value_name = "TARGET", required = true)]
+        target_ids: Vec<String>,
+        #[arg(long, value_name = "PATH")]
+        artifact: Option<PathBuf>,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — one signed `FORCE OFFBOARD <N> SYSTEMS` phrase covers
+    /// every target. Dest wipe is not implied.
+    #[command(name = "lifecycle-fleet-offboard")]
+    LifecycleFleetOffboard {
+        #[arg(long = "target-id", value_name = "TARGET", required = true)]
+        target_ids: Vec<String>,
+        #[arg(long, value_name = "JSON")]
+        confirmation_json: String,
+        #[arg(long, value_name = "HEX")]
+        verifying_key_hex: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — one signed `WIPE <N> SYSTEMS` phrase covers every
+    /// target. Only the declared offboard step runs; identity is not invented.
+    #[command(name = "lifecycle-fleet-reset")]
+    LifecycleFleetReset {
+        #[arg(long = "target-id", value_name = "TARGET", required = true)]
+        target_ids: Vec<String>,
+        #[arg(long, value_name = "JSON")]
+        confirmation_json: String,
+        #[arg(long, value_name = "HEX")]
+        verifying_key_hex: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — one signed `INSTALL UNSIGNED <N> SYSTEMS` phrase admits
+    /// the same artifact bytes on every seat. Dest install is not implied.
+    #[command(name = "lifecycle-fleet-unsigned-select")]
+    LifecycleFleetUnsignedSelect {
+        #[arg(long = "target-id", value_name = "TARGET", required = true)]
+        target_ids: Vec<String>,
+        /// JSON array of `LifecycleArtifactSelectionV1`, one per target.
+        #[arg(long, value_name = "JSON")]
+        selection_json: String,
+        #[arg(long, value_name = "JSON")]
+        confirmation_json: String,
+        #[arg(long, value_name = "HEX")]
+        verifying_key_hex: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — admit a coordinator handoff only when durable fleet
+    /// checkpoints already exist. Disconnecting the initiator cannot invent
+    /// a new generation.
+    #[command(name = "lifecycle-fleet-handoff")]
+    LifecycleFleetHandoff {
+        #[arg(long = "target-id", value_name = "TARGET", required = true)]
+        target_ids: Vec<String>,
+        #[arg(long, value_name = "ID")]
+        from_coordinator: String,
+        #[arg(long, value_name = "ID")]
+        to_coordinator: String,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
+    /// WL-FUNC-023 — reconstruct a fleet session from durable checkpoints.
+    /// Peek-only: a coordinator reboot cannot lose the job or steal locks.
+    #[command(name = "lifecycle-fleet-status")]
+    LifecycleFleetStatus {
+        #[arg(long = "target-id", value_name = "TARGET", required = true)]
+        target_ids: Vec<String>,
+        #[arg(long, env = "QNM_SHARED_ROOT")]
+        root: Option<PathBuf>,
+    },
     /// OW-2 — node self-diagnostic: KVM stack readiness (the KVM_SERVICES
     /// catalog), the mesh peer directory, and identity + CA presence. Prints a
     /// human report (or `--json`) and exits non-zero when a *critical* check
@@ -3635,6 +3711,181 @@ mod lifecycle_cli_boundary_tests {
             "first-boot verb must parse without a caller-selected step: {:?}",
             parsed.err().map(|error| error.kind())
         );
+    }
+
+    #[test]
+    fn lifecycle_fleet_upgrade_is_a_real_verb_without_caller_steps() {
+        let parsed = parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-upgrade".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "fleet upgrade must parse without a caller-selected step: {:?}",
+            parsed.err().map(|error| error.kind())
+        );
+        let error = match parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-upgrade".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+            "--step".into(),
+            "packages".into(),
+        ]) {
+            Ok(_) => panic!("fleet upgrade must not accept caller-selected steps"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn lifecycle_fleet_offboard_and_reset_are_real_verbs_without_caller_steps() {
+        for verb in ["lifecycle-fleet-offboard", "lifecycle-fleet-reset"] {
+            let parsed = parse_cli_on_large_test_stack(vec![
+                "mackesd".into(),
+                "onboard".into(),
+                verb.into(),
+                "--target-id".into(),
+                "seat-15".into(),
+                "--confirmation-json".into(),
+                "{}".into(),
+                "--verifying-key-hex".into(),
+                "00".repeat(32),
+            ]);
+            assert!(
+                parsed.is_ok(),
+                "{verb} must parse without a caller-selected step: {:?}",
+                parsed.err().map(|error| error.kind())
+            );
+            let error = match parse_cli_on_large_test_stack(vec![
+                "mackesd".into(),
+                "onboard".into(),
+                verb.into(),
+                "--target-id".into(),
+                "seat-15".into(),
+                "--confirmation-json".into(),
+                "{}".into(),
+                "--verifying-key-hex".into(),
+                "00".repeat(32),
+                "--step".into(),
+                "offboard".into(),
+            ]) {
+                Ok(_) => panic!("{verb} must not accept caller-selected steps"),
+                Err(error) => error,
+            };
+            assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+        }
+    }
+
+    #[test]
+    fn lifecycle_fleet_unsigned_select_is_a_real_verb_without_caller_steps() {
+        let parsed = parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-unsigned-select".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+            "--selection-json".into(),
+            "[]".into(),
+            "--confirmation-json".into(),
+            "{}".into(),
+            "--verifying-key-hex".into(),
+            "00".repeat(32),
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "unsigned fleet select must parse without a caller-selected step: {:?}",
+            parsed.err().map(|error| error.kind())
+        );
+        let error = match parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-unsigned-select".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+            "--selection-json".into(),
+            "[]".into(),
+            "--confirmation-json".into(),
+            "{}".into(),
+            "--verifying-key-hex".into(),
+            "00".repeat(32),
+            "--step".into(),
+            "packages".into(),
+        ]) {
+            Ok(_) => panic!("unsigned fleet select must not accept caller-selected steps"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn lifecycle_fleet_handoff_is_a_real_verb_without_caller_steps() {
+        let parsed = parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-handoff".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+            "--from-coordinator".into(),
+            "coord-a".into(),
+            "--to-coordinator".into(),
+            "coord-b".into(),
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "fleet handoff must parse without a caller-selected step: {:?}",
+            parsed.err().map(|error| error.kind())
+        );
+        let error = match parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-handoff".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+            "--from-coordinator".into(),
+            "coord-a".into(),
+            "--to-coordinator".into(),
+            "coord-b".into(),
+            "--step".into(),
+            "offboard".into(),
+        ]) {
+            Ok(_) => panic!("fleet handoff must not accept caller-selected steps"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
+    }
+
+    #[test]
+    fn lifecycle_fleet_status_is_a_real_verb_without_caller_steps() {
+        let parsed = parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-status".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+        ]);
+        assert!(
+            parsed.is_ok(),
+            "fleet status must parse without a caller-selected step: {:?}",
+            parsed.err().map(|error| error.kind())
+        );
+        let error = match parse_cli_on_large_test_stack(vec![
+            "mackesd".into(),
+            "onboard".into(),
+            "lifecycle-fleet-status".into(),
+            "--target-id".into(),
+            "seat-15".into(),
+            "--step".into(),
+            "offboard".into(),
+        ]) {
+            Ok(_) => panic!("fleet status must not accept caller-selected steps"),
+            Err(error) => error,
+        };
+        assert_eq!(error.kind(), ErrorKind::UnknownArgument);
     }
 }
 

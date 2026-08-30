@@ -19,6 +19,22 @@ pub fn decode_bounded<T: DeserializeOwned>(payload: &[u8]) -> Result<T, Lifecycl
     serde_json::from_slice(payload).map_err(|_| LifecycleIntentError::InvalidField("payload"))
 }
 
+/// Name a verified staged pin. Dest NEVRA/path is never this string.
+#[must_use]
+pub fn staged_package_identity(digest_hex: &str, shape: &str, bytes: &[u8]) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    if digest_hex.len() != 64 || !digest_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        return None;
+    }
+    if !matches!(shape, "rpm" | "bootc" | "kickstart" | "nocloud" | "usb") {
+        return None;
+    }
+    let observed = format!("{:x}", Sha256::digest(bytes));
+    observed
+        .eq_ignore_ascii_case(digest_hex)
+        .then(|| format!("staged:{digest_hex}:{shape}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LifecycleIntentKind {
@@ -422,6 +438,26 @@ impl LifecycleConfirmationV1 {
             .map_err(|_| LifecycleIntentError::InvalidField("signature_hex"))
     }
 
+    /// Digest of the sorted unique fleet target set. GUI, TUI, and the
+    /// authority must compute the same value so a confirmation cannot cover
+    /// a different seat list.
+    #[must_use]
+    pub fn fleet_scope_digest(target_ids: &[impl AsRef<str>]) -> String {
+        let mut ids = target_ids
+            .iter()
+            .map(|target| target.as_ref().to_owned())
+            .collect::<Vec<_>>();
+        ids.sort();
+        ids.dedup();
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        for id in &ids {
+            hasher.update(id.as_bytes());
+            hasher.update(b"\n");
+        }
+        encode_hex(&hasher.finalize())
+    }
+
     #[must_use]
     pub fn expected_phrase(action: LifecycleConfirmationAction, target_count: u32) -> String {
         match action {
@@ -556,26 +592,36 @@ pub struct LifecycleBaselineEntryV1 {
 #[must_use]
 pub fn canonical_lifecycle_baseline() -> Vec<LifecycleBaselineEntryV1> {
     [
-        ("packages", LifecycleStepKind::Packages),
-        ("units", LifecycleStepKind::Configuration),
-        ("configuration", LifecycleStepKind::Configuration),
-        ("mesh_identity", LifecycleStepKind::Mesh),
-        ("compute", LifecycleStepKind::Compute),
-        ("ui", LifecycleStepKind::Ui),
-        ("hardware", LifecycleStepKind::Hardware),
-        ("verification", LifecycleStepKind::Verify),
+        ("packages", LifecycleStepKind::Packages, &[] as &[&str]),
+        ("units", LifecycleStepKind::Configuration, &["packages"]),
+        (
+            "configuration",
+            LifecycleStepKind::Configuration,
+            &["packages"],
+        ),
+        ("mesh_identity", LifecycleStepKind::Mesh, &["configuration"]),
+        ("compute", LifecycleStepKind::Compute, &["mesh_identity"]),
+        ("ui", LifecycleStepKind::Ui, &["mesh_identity"]),
+        ("hardware", LifecycleStepKind::Hardware, &["packages"]),
+        (
+            "verification",
+            LifecycleStepKind::Verify,
+            &["packages", "configuration", "mesh_identity"],
+        ),
     ]
     .into_iter()
-    .map(|(requirement_id, owner_step)| LifecycleBaselineEntryV1 {
-        schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
-        requirement_id: requirement_id.into(),
-        owner_step,
-        required: true,
-        provider: "mackesd".into(),
-        critical: true,
-        prerequisites: Vec::new(),
-        correction_step: owner_step,
-    })
+    .map(
+        |(requirement_id, owner_step, prerequisites)| LifecycleBaselineEntryV1 {
+            schema_version: LIFECYCLE_CONTRACT_SCHEMA_VERSION,
+            requirement_id: requirement_id.into(),
+            owner_step,
+            required: true,
+            provider: "mackesd".into(),
+            critical: true,
+            prerequisites: prerequisites.iter().map(|id| (*id).to_owned()).collect(),
+            correction_step: owner_step,
+        },
+    )
     .collect()
 }
 
@@ -622,6 +668,9 @@ pub struct FleetLifecycleReportV1 {
     pub target_count: u32,
     pub succeeded: u32,
     pub failed: u32,
+    /// Durable fleet coordinator. Empty until the first handoff claim.
+    #[serde(default)]
+    pub coordinator_id: String,
     #[serde(default)]
     pub signature_hex: String,
 }
@@ -946,7 +995,7 @@ impl FleetLifecycleReportV1 {
 
     fn signing_bytes(&self) -> Vec<u8> {
         format!(
-            "{}|{}|{}|{}|{}|{}|{}|{}",
+            "{}|{}|{}|{}|{}|{}|{}|{}|{}",
             Self::SIGNING_DOMAIN,
             self.schema_version,
             self.request_id,
@@ -954,7 +1003,8 @@ impl FleetLifecycleReportV1 {
             serde_json::to_string(&self.phase).expect("phase serializes"),
             self.target_count,
             self.succeeded,
-            self.failed
+            self.failed,
+            self.coordinator_id
         )
         .into_bytes()
     }
@@ -986,6 +1036,15 @@ impl FleetLifecycleReportV1 {
             || self.succeeded.saturating_add(self.failed) > self.target_count
         {
             return Err(LifecycleIntentError::InvalidNumber("target_count"));
+        }
+        if !self.coordinator_id.is_empty()
+            && (self.coordinator_id.len() > MAX_LIFECYCLE_IDENTIFIER_BYTES
+                || !self
+                    .coordinator_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')))
+        {
+            return Err(LifecycleIntentError::InvalidField("coordinator_id"));
         }
         if !self.signature_hex.is_empty()
             && (self.signature_hex.len() != 128
@@ -1065,7 +1124,12 @@ mod tests {
         assert!(baseline
             .iter()
             .any(|entry| entry.requirement_id == "mesh_identity"
-                && entry.owner_step == LifecycleStepKind::Mesh));
+                && entry.owner_step == LifecycleStepKind::Mesh
+                && entry.prerequisites == ["configuration"]));
+        assert!(baseline.iter().any(|entry| {
+            entry.requirement_id == "verification"
+                && entry.prerequisites.contains(&"mesh_identity".into())
+        }));
     }
 
     #[test]
@@ -1166,6 +1230,7 @@ mod tests {
             target_count: 2,
             succeeded: 2,
             failed: 1,
+            coordinator_id: String::new(),
             signature_hex: String::new(),
         };
         assert!(matches!(
@@ -1180,10 +1245,18 @@ mod tests {
             target_count: 2,
             succeeded: 2,
             failed: 0,
+            coordinator_id: "coord-b".into(),
             signature_hex: String::new(),
         };
         let key = SigningKey::from_bytes(&[15; 32]);
-        assert!(report.sign(&key).verify(&key.verifying_key()).is_ok());
+        let signed = report.sign(&key);
+        assert!(signed.verify(&key.verifying_key()).is_ok());
+        let mut swapped = signed.clone();
+        swapped.coordinator_id = "coord-forged".into();
+        assert!(
+            swapped.verify(&key.verifying_key()).is_err(),
+            "disconnected initiator cannot swap the signed coordinator"
+        );
     }
 
     #[test]
@@ -1223,6 +1296,20 @@ mod tests {
             invalid.validate(),
             Err(LifecycleIntentError::InvalidField("target_ids"))
         ));
+    }
+
+    #[test]
+    fn fleet_scope_digest_is_order_independent_and_deduped() {
+        let forward = LifecycleConfirmationV1::fleet_scope_digest(&["seat-16", "seat-15"]);
+        let reverse =
+            LifecycleConfirmationV1::fleet_scope_digest(&["seat-15", "seat-16", "seat-15"]);
+        assert_eq!(forward, reverse);
+        assert_eq!(forward.len(), 64);
+        assert!(forward.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(
+            forward,
+            LifecycleConfirmationV1::fleet_scope_digest(&["seat-15", "seat-99"])
+        );
     }
 
     #[test]

@@ -304,29 +304,18 @@ fn doctor() -> ExitCode {
         critical: true,
     });
 
-    // WL-FUNC-023 S17 — doctor consumes the canonical first-boot markers, not
-    // `mackesd status` as a readiness proxy.
-    let pending = PathBuf::from("/var/lib/mackesd/lifecycle/pending-convergence");
-    let converged = PathBuf::from("/var/lib/mackesd/lifecycle/firstboot-converged");
-    if pending.exists() {
-        checks.push(Check {
-            name: "lifecycle: first-boot",
-            ok: false,
-            detail: "pending-convergence queued; core baseline still blocked".into(),
-            critical: true,
-        });
-    } else {
-        checks.push(Check {
-            name: "lifecycle: first-boot",
-            ok: converged.is_file(),
-            detail: if converged.is_file() {
-                "canonical baseline converged".into()
-            } else {
-                "firstboot-converged marker missing".into()
-            },
-            critical: true,
-        });
-    }
+    // WL-FUNC-023 S17 — doctor consumes the canonical first-boot markers and
+    // the persisted VAC action, not `mackesd status` as a readiness proxy.
+    let (ok, lines) = mackesd_core::onboard::firstboot::doctor_fleet_lifecycle_lines(
+        std::path::Path::new("/var/lib/mackesd/lifecycle"),
+        std::path::Path::new("/var/lib/mackesd"),
+    );
+    checks.push(Check {
+        name: "lifecycle: first-boot",
+        ok,
+        detail: mackesd_core::onboard::firstboot::doctor_check_detail(&lines),
+        critical: true,
+    });
 
     // Report.
     let mut failed_critical = false;
@@ -529,6 +518,19 @@ fn leak(s: String) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doctor_lifecycle_detail_leads_with_a_symlink_refuse() {
+        let detail = mackesd_core::onboard::firstboot::doctor_check_detail(&[
+            "first-boot marker must not be a symlink; dest repair is not implied".into(),
+            "fleet seat-15, seat-16".into(),
+        ]);
+        assert!(
+            detail.starts_with("first-boot marker must not be a symlink"),
+            "meshctl doctor must not hide a planted marker behind fleet seats: {detail}"
+        );
+        assert!(detail.contains("fleet seat-15, seat-16"), "{detail}");
+    }
 
     #[test]
     fn latest_verdict_picks_the_newest_run_with_a_verdict() {

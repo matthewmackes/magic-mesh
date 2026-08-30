@@ -2620,7 +2620,14 @@ impl Shell {
                 ui.add_space(Style::SP_S);
                 workbench::show_action_console(ui);
             }
-            WorkersDestination::SafePower => self.power_cycle.show(ui, &mut self.system),
+            WorkersDestination::SafePower => {
+                self.power_cycle.show(ui, &mut self.system);
+                if let Some(route) = self.power_cycle.take_lifecycle_route() {
+                    if let Some(page) = this_node_catalog::page_for_route(route) {
+                        self.workers_destination = WorkersDestination::ThisNodePage(page);
+                    }
+                }
+            }
             plane @ (WorkersDestination::Network
             | WorkersDestination::Fleet
             | WorkersDestination::Provisioning) => {

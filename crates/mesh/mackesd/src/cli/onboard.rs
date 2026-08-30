@@ -58,18 +58,19 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
         }
         OnboardCmd::LifecycleReadiness { target_id, root } => {
             let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
-            let authority =
-                mackesd_core::lifecycle_authority::LifecycleAuthority::resume(&root, &target_id)
+            let checkpoint =
+                mackesd_core::lifecycle_authority::LifecycleAuthority::peek(&root, &target_id)
                     .map_err(|error| {
-                        anyhow::anyhow!("cannot resume lifecycle authority: {error:?}")
+                        anyhow::anyhow!("cannot peek lifecycle authority: {error:?}")
                     })?;
-            let readiness = authority
+            let readiness = checkpoint
                 .readiness()
                 .map_err(|error| anyhow::anyhow!("cannot derive lifecycle readiness: {error:?}"))?;
             println!("{}", serde_json::to_string(&readiness)?);
-            authority.finish().map_err(|error| {
-                anyhow::anyhow!("cannot release lifecycle authority: {error:?}")
-            })?;
+            for line in mackesd_core::onboard::firstboot::readiness_status_lines(&root, &checkpoint)
+            {
+                eprintln!("{line}");
+            }
         }
         OnboardCmd::LifecycleArtifactSelect {
             target_id,
@@ -243,6 +244,18 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
                 Ok(class) => class.role,
                 Err(_) => mde_role::Role::Lighthouse,
             };
+            if report_only {
+                let (readiness, lines) =
+                    firstboot::report_only_firstboot(&root, &marker_dir, &target_id, role);
+                println!("{}", serde_json::to_string(&readiness)?);
+                for line in lines {
+                    eprintln!("{line}");
+                }
+                if !readiness.ready {
+                    std::process::exit(1);
+                }
+                return Ok(());
+            }
             let mut authority = match mackesd_core::lifecycle_authority::LifecycleAuthority::resume(
                 &root, &target_id,
             ) {
@@ -275,13 +288,38 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             // Count invite/enrollment bearers from the workgroup ledger. The
             // capsule retain check below is independent — do not overwrite
             // the live ledger count with pending_capsule_ids.
-            let facts =
-                firstboot::gather_live_in(&target_id, generation, role, Some(root.as_path()));
+            let facts = firstboot::gather_live_in(
+                &target_id,
+                generation,
+                role,
+                Some(root.as_path()),
+                Some(marker_dir.as_path()),
+            );
             let checks = firstboot::assemble(&facts);
             let readiness = firstboot::record_on_authority(&mut authority, checks.clone())
                 .map_err(|error| anyhow::anyhow!("cannot record first-boot checks: {error:?}"))?;
             println!("{}", serde_json::to_string(&readiness)?);
+            if let Some(line) = firstboot::onboard_nag_line(&checks) {
+                eprintln!("first-boot nag: {line}");
+            }
+            if let Some(line) = firstboot::preview_correction_line(&authority) {
+                eprintln!("first-boot correction: {line}");
+            }
+            if let Some(line) = firstboot::planted_marker_refuse_line(&marker_dir) {
+                eprintln!("first-boot doctor: {line}");
+            }
+            for line in firstboot::firstboot_fleet_status_lines(&root) {
+                eprintln!("first-boot fleet: {line}");
+            }
             if !report_only {
+                firstboot::pin_mesh_join_from_env(&marker_dir)
+                    .map_err(|error| anyhow::anyhow!("cannot pin join dests: {error}"))?;
+                if let Err(error) = authority.run_declared_until_blocked(None) {
+                    let _ = authority.finish();
+                    return Err(anyhow::anyhow!(
+                        "first-boot declared steps failed: {error:?}"
+                    ));
+                }
                 // Credential env, never argv: a failed join can re-present
                 // the bearer so first-boot retains it (S6/S17).
                 let presented = std::env::var("MCNF_ENROLLMENT_TOKEN")
@@ -309,6 +347,95 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
             })?;
             if !readiness.ready {
                 std::process::exit(1);
+            }
+        }
+        OnboardCmd::LifecycleFleetUpgrade {
+            target_ids,
+            artifact,
+            root,
+        } => run_fleet_lifecycle(&target_ids, root, |authorities| {
+            mackesd_core::lifecycle_authority::execute_fleet_upgrade(
+                authorities,
+                artifact.as_deref(),
+            )
+        })?,
+        OnboardCmd::LifecycleFleetOffboard {
+            target_ids,
+            confirmation_json,
+            verifying_key_hex,
+            root,
+        } => {
+            let (confirmation, verifying_key) =
+                parse_fleet_confirmation(&confirmation_json, &verifying_key_hex)?;
+            run_fleet_lifecycle(&target_ids, root, |authorities| {
+                mackesd_core::lifecycle_authority::execute_fleet_offboard(
+                    authorities,
+                    confirmation,
+                    &verifying_key,
+                )
+            })?;
+        }
+        OnboardCmd::LifecycleFleetReset {
+            target_ids,
+            confirmation_json,
+            verifying_key_hex,
+            root,
+        } => {
+            let (confirmation, verifying_key) =
+                parse_fleet_confirmation(&confirmation_json, &verifying_key_hex)?;
+            run_fleet_lifecycle(&target_ids, root, |authorities| {
+                mackesd_core::lifecycle_authority::execute_fleet_reset(
+                    authorities,
+                    confirmation,
+                    &verifying_key,
+                )
+            })?;
+        }
+        OnboardCmd::LifecycleFleetUnsignedSelect {
+            target_ids,
+            selection_json,
+            confirmation_json,
+            verifying_key_hex,
+            root,
+        } => {
+            let selections: Vec<mackes_mesh_types::lifecycle::LifecycleArtifactSelectionV1> =
+                serde_json::from_str(&selection_json).map_err(|error| {
+                    anyhow::anyhow!("invalid fleet artifact selection: {error}")
+                })?;
+            let (confirmation, verifying_key) =
+                parse_fleet_confirmation(&confirmation_json, &verifying_key_hex)?;
+            run_fleet_lifecycle(&target_ids, root, |authorities| {
+                mackesd_core::lifecycle_authority::execute_fleet_unsigned_select(
+                    authorities,
+                    &selections,
+                    confirmation,
+                    &verifying_key,
+                )
+            })?;
+        }
+        OnboardCmd::LifecycleFleetHandoff {
+            target_ids,
+            from_coordinator,
+            to_coordinator,
+            root,
+        } => run_fleet_lifecycle(&target_ids, root, |authorities| {
+            mackesd_core::lifecycle_authority::execute_fleet_handoff(
+                authorities,
+                &from_coordinator,
+                &to_coordinator,
+            )
+        })?,
+        OnboardCmd::LifecycleFleetStatus { target_ids, root } => {
+            let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+            let (report, checkpoints) =
+                mackesd_core::lifecycle_authority::peek_fleet_session(&root, &target_ids).map_err(
+                    |error| anyhow::anyhow!("cannot peek fleet lifecycle session: {error:?}"),
+                )?;
+            println!("{}", serde_json::to_string(&report)?);
+            for line in
+                mackesd_core::onboard::firstboot::fleet_status_lines(&root, &report, &checkpoints)
+            {
+                eprintln!("{line}");
             }
         }
         OnboardCmd::SelfTest { json } => {
@@ -921,6 +1048,65 @@ pub fn run(verb: OnboardCmd, db_path: PathBuf) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn parse_fleet_confirmation(
+    confirmation_json: &str,
+    verifying_key_hex: &str,
+) -> anyhow::Result<(
+    mackes_mesh_types::lifecycle::LifecycleConfirmationV1,
+    ed25519_dalek::VerifyingKey,
+)> {
+    use ed25519_dalek::VerifyingKey;
+    use mackes_mesh_types::lifecycle::LifecycleConfirmationV1;
+    let confirmation: LifecycleConfirmationV1 = serde_json::from_str(confirmation_json)
+        .map_err(|error| anyhow::anyhow!("invalid lifecycle confirmation: {error}"))?;
+    let key_bytes = parse_hex_32(verifying_key_hex)
+        .ok_or_else(|| anyhow::anyhow!("verifying key must be exactly 64 hex characters"))?;
+    let verifying_key = VerifyingKey::from_bytes(&key_bytes)
+        .map_err(|error| anyhow::anyhow!("invalid verifying key: {error}"))?;
+    Ok((confirmation, verifying_key))
+}
+
+fn run_fleet_lifecycle<F>(
+    target_ids: &[String],
+    root: Option<PathBuf>,
+    execute: F,
+) -> anyhow::Result<()>
+where
+    F: FnOnce(
+        &mut [mackesd_core::lifecycle_authority::LifecycleAuthority],
+    ) -> Result<
+        mackes_mesh_types::lifecycle::FleetLifecycleReportV1,
+        mackesd_core::lifecycle_authority::LifecycleAuthorityError,
+    >,
+{
+    let root = root.unwrap_or_else(mackesd_core::default_qnm_shared_root);
+    let mut authorities = mackesd_core::lifecycle_authority::resume_fleet(&root, target_ids)
+        .map_err(|error| anyhow::anyhow!("cannot resume fleet lifecycle: {error:?}"))?;
+    let report = match execute(&mut authorities) {
+        Ok(report) => report,
+        Err(error) => {
+            for authority in authorities {
+                let _ = authority.finish();
+            }
+            return Err(anyhow::anyhow!("cannot execute fleet lifecycle: {error:?}"));
+        }
+    };
+    println!("{}", serde_json::to_string(&report)?);
+    let checkpoints = authorities
+        .iter()
+        .map(|authority| authority.checkpoint().clone())
+        .collect::<Vec<_>>();
+    for line in mackesd_core::onboard::firstboot::fleet_status_lines(&root, &report, &checkpoints) {
+        eprintln!("{line}");
+    }
+    for authority in authorities {
+        authority
+            .finish()
+            .map_err(|error| anyhow::anyhow!("cannot release lifecycle authority: {error:?}"))?;
+    }
+    Ok(())
+}
+
 fn parse_hex_32(value: &str) -> Option<[u8; 32]> {
     if value.len() != 64 {
         return None;
@@ -975,6 +1161,9 @@ mod tests {
             active_units: vec!["mackesd.service".into(), "nebula.service".into()],
             configuration_present: true,
             mesh_identity_present: true,
+            overlay_ip_present: true,
+            etcd_endpoints_present: true,
+            etcd_endpoints_required: false,
             compute_usable: true,
             ui_applicable: false,
             ui_ready: false,
@@ -1009,8 +1198,13 @@ mod tests {
             "redeem_once consumed the bearer before transport"
         );
 
-        let facts =
-            firstboot::gather_live_in("seat-15", 1, mde_role::Role::Lighthouse, Some(&workgroup));
+        let facts = firstboot::gather_live_in(
+            "seat-15",
+            1,
+            mde_role::Role::Lighthouse,
+            Some(&workgroup),
+            None,
+        );
         assert_eq!(
             facts.pending_enrollment_tokens, 0,
             "consumed invite must not be counted until first-boot retains it"
@@ -1047,8 +1241,14 @@ mod tests {
         assert!(!markers.join(FIRSTBOOT_CONVERGED).exists());
         assert!(markers.join(FIRSTBOOT_PENDING).exists());
         assert_eq!(
-            firstboot::gather_live_in("seat-15", 1, mde_role::Role::Lighthouse, Some(&workgroup))
-                .pending_enrollment_tokens,
+            firstboot::gather_live_in(
+                "seat-15",
+                1,
+                mde_role::Role::Lighthouse,
+                Some(&workgroup),
+                None,
+            )
+            .pending_enrollment_tokens,
             1
         );
     }

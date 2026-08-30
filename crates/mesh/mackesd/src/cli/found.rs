@@ -202,6 +202,13 @@ fn run_inner(
 
     // SETUP-7 — capture the founding facts for idempotent re-convergence.
     emit_site_yml_best_effort(parsed.as_str(), mesh_id, vec![report.overlay_ip.clone()]);
+    if let Err(error) = mackesd_core::onboard::firstboot::pin_and_stage_mesh_join(
+        &root,
+        &report.overlay_ip,
+        None,
+    ) {
+        eprintln!("found: could not stage join dests ({error}); dest write is not implied");
+    }
 
     let grouped = std::path::Path::new(
         mackesd_core::onboard::role_provision::GROUPED_MACKESD_CONTROL_UNIT_FILE,

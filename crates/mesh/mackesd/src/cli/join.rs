@@ -647,6 +647,22 @@ fn run_inner(
     // only, and no token can reach argv, stdout, or diagnostics.
     drop(raw_token);
 
+    let etcd_pin = (effective_role == mde_role::Role::Workstation).then(|| {
+        bundle
+            .lighthouses
+            .iter()
+            .map(|lh| mackesd_core::substrate::etcd_membership::client_url(&lh.overlay_ip))
+            .collect::<Vec<_>>()
+            .join("\n")
+    });
+    if let Err(error) = mackesd_core::onboard::firstboot::pin_and_stage_mesh_join(
+        &root,
+        &bundle.overlay_ip,
+        etcd_pin.as_deref().filter(|body| !body.trim().is_empty()),
+    ) {
+        eprintln!("join: could not stage join dests ({error}); dest write is not implied");
+    }
+
     // Bring the peer fully live + boot-durable (ONBOARD-9): the overlay, the
     // worker daemon, and the health watchdog — not just nebula. A `join` now
     // leaves a node that survives reboot and self-recovers, instead of one the

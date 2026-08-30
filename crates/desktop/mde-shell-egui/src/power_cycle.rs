@@ -6,8 +6,7 @@
 //! create a generic command path.
 
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::path::PathBuf;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use mde_bus::hooks::config::Priority;
@@ -25,18 +24,9 @@ const TARGET_REFRESH: Duration = Duration::from_secs(2);
 const REMOTE_FRESHNESS: Duration = Duration::from_secs(30);
 const MIRROR_PREFIX: &str = "state/host/";
 const MIRROR_SUFFIX: &str = "/seat";
-// WL-FUNC-023 S4 — the legacy Construct entry point must reach the one
-// shipped lifecycle authority. Keep the environment override for an
-// installed renderer-specific launcher, but default to the shared TUI rather
-// than a binary that is not packaged by the RPM.
-const ONBOARDING_BIN: &str = "/usr/bin/magic-setup";
-/// Dest identity and join-token env must not leak into the lifecycle child.
-/// Login leftover (2): only the dest-env runner sources those vars.
-const LIFECYCLE_CHILD_ENV_STRIP: &[&str] = &[
-    "MACKESD_BOOTSTRAP_SSH_KEY",
-    "MACKESD_BOOTSTRAP_KNOWN_HOSTS",
-    "JOIN_TOKEN",
-];
+/// WL-FUNC-023 S4 — Safe Power Cycle must not spawn a second lifecycle
+/// renderer. The shared Construct page is This Node · Updates & Lifecycle.
+const LIFECYCLE_ROUTE: &str = "this-node/updates";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PowerCycleAction {
@@ -139,6 +129,7 @@ pub(crate) struct PowerCycleState {
     error: Option<String>,
     last_refresh: Option<Instant>,
     submitted_remote: Option<PendingRemoteResult>,
+    pending_lifecycle_route: bool,
 }
 
 impl Default for PowerCycleState {
@@ -161,6 +152,7 @@ impl Default for PowerCycleState {
             error: None,
             last_refresh: None,
             submitted_remote: None,
+            pending_lifecycle_route: false,
         }
     }
 }
@@ -602,34 +594,26 @@ impl PowerCycleState {
         ui.label(RichText::new("Node lifecycle").strong().size(Style::TITLE));
         ui.colored_label(
             Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
-            "Add and remove people or nodes in the separate lifecycle experience.",
+            "Add and remove people or nodes on This Node · Updates & Lifecycle. Mutation stays with the mackesd authority.",
         );
-        let path = onboarding_path();
-        let available = trusted_executable(&path);
-        let response = ui.add_enabled(
-            available,
-            egui::Button::new("Open Onboarding & Offboarding ↗"),
-        );
-        if response.clicked() {
-            match lifecycle_launcher_command(&path).spawn() {
-                Ok(_) => {
-                    self.status = Some("Opened Onboarding & Offboarding.".to_owned());
-                    self.error = None;
-                }
-                Err(error) => {
-                    self.error = Some(format!("Open Onboarding & Offboarding: {error}"));
-                    self.status = None;
-                }
-            }
-        } else if !available {
-            let _ = mde_egui::disabled_hover_text(
-                response,
-                "Onboarding & Offboarding is not installed on this node.",
-            );
-            ui.colored_label(
-                Style::resolve_color(ui.ctx(), Style::TEXT_DIM),
-                "Onboarding & Offboarding is not installed on this node.",
-            );
+        if ui.button("Open Updates & Lifecycle").clicked() {
+            self.request_lifecycle_route();
+            self.status = Some("Opening Updates & Lifecycle.".to_owned());
+            self.error = None;
+        }
+    }
+
+    fn request_lifecycle_route(&mut self) {
+        self.pending_lifecycle_route = true;
+    }
+
+    /// Consume a pending in-shell lifecycle navigation request.
+    pub(crate) fn take_lifecycle_route(&mut self) -> Option<&'static str> {
+        if self.pending_lifecycle_route {
+            self.pending_lifecycle_route = false;
+            Some(LIFECYCLE_ROUTE)
+        } else {
+            None
         }
     }
 
@@ -711,45 +695,6 @@ fn fact(ui: &mut egui::Ui, label: &str, value: impl Into<String>) {
     ui.end_row();
 }
 
-fn strip_lifecycle_child_env(command: &mut Command) {
-    for name in LIFECYCLE_CHILD_ENV_STRIP {
-        command.env_remove(*name);
-    }
-}
-
-fn lifecycle_launcher_command(path: &Path) -> Command {
-    let mut command = Command::new(path);
-    strip_lifecycle_child_env(&mut command);
-    command
-}
-
-fn onboarding_path() -> PathBuf {
-    std::env::var_os("MDE_ONBOARDING_OFFBOARDING_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from(ONBOARDING_BIN))
-}
-
-fn trusted_executable(path: &Path) -> bool {
-    if !path.is_absolute() {
-        return false;
-    }
-    let Ok(metadata) = fs::symlink_metadata(path) else {
-        return false;
-    };
-    if !metadata.file_type().is_file() || metadata.file_type().is_symlink() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn local_hostname() -> String {
     std::env::var("HOSTNAME")
         .ok()
@@ -804,51 +749,12 @@ mod tests {
     }
 
     #[test]
-    fn lifecycle_launcher_strips_bootstrap_dest_env() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let script = directory.path().join("lifecycle-gui");
-        fs::write(
-            &script,
-            "#!/bin/sh\nprintf '%s' \"$MACKESD_BOOTSTRAP_SSH_KEY$MACKESD_BOOTSTRAP_KNOWN_HOSTS$JOIN_TOKEN\"\n",
-        )
-        .expect("write script");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&script, fs::Permissions::from_mode(0o755))
-                .expect("make executable");
-        }
-        let mut command = Command::new(&script);
-        command.env("MACKESD_BOOTSTRAP_SSH_KEY", "/tmp/must-not-leak");
-        command.env("MACKESD_BOOTSTRAP_KNOWN_HOSTS", "/tmp/must-not-leak-hosts");
-        command.env("JOIN_TOKEN", "must-not-leak-token");
-        strip_lifecycle_child_env(&mut command);
-        let output = command.output().expect("run stripped launcher");
-        assert!(
-            output.status.success(),
-            "stderr={}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-        assert!(
-            output.stdout.is_empty(),
-            "lifecycle child inherited dest env: {}",
-            String::from_utf8_lossy(&output.stdout)
-        );
-    }
-
-    #[test]
-    fn onboarding_launcher_requires_absolute_regular_executable() {
-        let directory = tempfile::tempdir().expect("tempdir");
-        let executable = directory.path().join("lifecycle-gui");
-        fs::write(&executable, "#!/bin/sh\n").expect("write executable");
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt as _;
-            fs::set_permissions(&executable, fs::Permissions::from_mode(0o755))
-                .expect("make executable");
-        }
-        assert!(trusted_executable(&executable));
-        assert!(!trusted_executable(Path::new("relative-gui")));
+    fn open_onboarding_requests_this_node_lifecycle_route() {
+        let mut state = PowerCycleState::default();
+        assert_eq!(state.take_lifecycle_route(), None);
+        state.request_lifecycle_route();
+        assert_eq!(state.take_lifecycle_route(), Some("this-node/updates"));
+        assert_eq!(state.take_lifecycle_route(), None);
     }
 
     #[test]

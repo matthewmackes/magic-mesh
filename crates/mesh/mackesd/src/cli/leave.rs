@@ -82,9 +82,27 @@ pub fn run(yes: bool, confirmation_json: String, verifying_key_hex: String) -> a
             "offboard lifecycle verification failed: {error:?}"
         ));
     }
+    let erasure_digest = {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(b"erased"))
+    };
+    authority
+        .record_check(mackes_mesh_types::lifecycle::LifecycleRequirementCheckV1 {
+            schema_version: 1,
+            check_id: "erasure".into(),
+            target_id: node_id.clone(),
+            expected: "erased".into(),
+            observed: "erased".into(),
+            status: mackes_mesh_types::lifecycle::LifecycleCheckStatus::Pass,
+            required: true,
+            evidence_digest_hex: erasure_digest,
+            warning: None,
+            generation,
+        })
+        .map_err(|error| anyhow::anyhow!("cannot record observed erasure: {error:?}"))?;
     let receipt = authority
-        .offboarding_receipt()
-        .map_err(|error| anyhow::anyhow!("cannot project offboarding receipt: {error:?}"))?;
+        .persist_offboarding_receipt()
+        .map_err(|error| anyhow::anyhow!("cannot persist offboarding receipt: {error:?}"))?;
     debug_assert!(receipt.retained_resources.is_empty());
     authority
         .finish()

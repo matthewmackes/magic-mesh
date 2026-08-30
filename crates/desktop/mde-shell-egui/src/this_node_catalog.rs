@@ -477,7 +477,8 @@ const PAGE_INDEX: [PageEntry; 20] = [
         section: Section::MeshSystem,
         provider: provider_for(Section::MeshSystem),
         label: "Updates & Lifecycle",
-        description: "Updates, recovery, reset, and lifecycle state.",
+        description:
+            "Shared ONBOARD session for updates and lifecycle; mutation stays with mackesd.",
         keywords: &[
             "updates",
             "update",
@@ -495,15 +496,15 @@ const PAGE_INDEX: [PageEntry; 20] = [
             "Recovery and reset remain behind a privileged node provider.",
         ),
         label: "Recovery & Reset",
-        description: "Recovery environment, reset posture, and safe restoration.",
-        keywords: &["recovery", "reset", "restore", "safe recovery"],
+        description: "Shared ONBOARD session for recovery and reset; mutation stays with mackesd.",
+        keywords: &["recovery", "reset", "restore", "safe recovery", "lifecycle"],
     },
     PageEntry {
         route: "this-node/backup-restore",
         section: Section::MeshSystem,
         provider: PageProvider::Available,
         label: "Backup & Restore",
-        description: "Backup, restore, and recovery evidence.",
+        description: "Backup evidence only. Restore and wipe stay with mackesd.",
         keywords: &["backup", "restore", "backup and restore"],
     },
     PageEntry {
@@ -773,6 +774,20 @@ mod tests {
         assert!(recovery
             .unavailable_reason()
             .is_some_and(|reason| reason.contains("privileged")));
+        assert!(
+            recovery.description.contains("ONBOARD session"),
+            "recovery-reset must name the shared lifecycle session"
+        );
+        let updates = page_for_route("this-node/updates").expect("updates route");
+        assert!(
+            updates.description.contains("ONBOARD session"),
+            "updates must name the same shared lifecycle session"
+        );
+        let backup = page_for_route("this-node/backup-restore").expect("backup route");
+        assert!(
+            backup.description.contains("stay with mackesd"),
+            "backup-restore must not claim dest wipe"
+        );
         let privacy = page_for_route("this-node/security-privacy").expect("privacy page route");
         assert!(
             privacy.is_available(),

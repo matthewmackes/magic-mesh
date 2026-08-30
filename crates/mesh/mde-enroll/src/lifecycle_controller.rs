@@ -5,7 +5,8 @@
 //! and submit it through the authority-owned Bus path.
 
 use mackes_mesh_types::lifecycle::{
-    LifecycleIntentKind, LifecycleIntentV1, LifecyclePhase, LifecyclePlanV1, LifecycleProgressV1,
+    FleetLifecycleReportV1, LifecycleIntentKind, LifecycleIntentV1, LifecyclePhase,
+    LifecyclePlanV1, LifecycleProgressV1, MAX_LIFECYCLE_IDENTIFIER_BYTES,
 };
 use std::collections::BTreeMap;
 
@@ -15,6 +16,8 @@ pub struct LifecycleController {
     pub generation: u64,
     pub targets: Vec<String>,
     last_progress: BTreeMap<String, LifecycleProgressV1>,
+    /// Durable coordinator from authority checkpoints. Empty until first claim.
+    coordinator_id: Option<String>,
 }
 
 impl LifecycleController {
@@ -26,7 +29,31 @@ impl LifecycleController {
             generation,
             targets,
             last_progress: BTreeMap::new(),
+            coordinator_id: None,
         }
+    }
+
+    /// Bind a renderer to a peeked fleet report. Target count and
+    /// coordinator come from durable checkpoints; a GUI cannot shrink them.
+    pub fn from_fleet_report(
+        report: &FleetLifecycleReportV1,
+        targets: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Result<Self, ProgressError> {
+        report
+            .validate()
+            .map_err(|error| ProgressError::Invalid(format!("{error:?}")))?;
+        let mut controller = Self::new(
+            report.request_id.clone(),
+            report.generation,
+            targets.into_iter().map(Into::into).collect(),
+        );
+        if controller.targets.is_empty() || controller.targets.len() as u32 != report.target_count {
+            return Err(ProgressError::Invalid("fleet targets".into()));
+        }
+        controller.bind_coordinator(
+            (!report.coordinator_id.is_empty()).then(|| report.coordinator_id.clone()),
+        )?;
+        Ok(controller)
     }
 
     pub fn plan(&self, intent: LifecycleIntentKind, target_id: &str) -> Option<LifecyclePlanV1> {
@@ -56,6 +83,98 @@ impl LifecycleController {
 
     pub fn fleet_targets(&self) -> &[String] {
         &self.targets
+    }
+
+    /// Bind the coordinator already recorded on durable checkpoints.
+    /// A renderer cannot invent a different initiator after that.
+    pub fn bind_coordinator(
+        &mut self,
+        coordinator_id: Option<String>,
+    ) -> Result<(), ProgressError> {
+        if let Some(id) = coordinator_id.as_deref() {
+            if !coordinator_id_ok(id) {
+                return Err(ProgressError::Invalid("coordinator".into()));
+            }
+        }
+        self.coordinator_id = coordinator_id;
+        Ok(())
+    }
+
+    /// Same coordinator line the shared session view prints.
+    #[must_use]
+    pub fn coordinator_line(&self) -> Option<String> {
+        self.coordinator_id
+            .as_ref()
+            .map(|id| format!("coordinator {id}"))
+    }
+
+    /// Same fleet seat line the shared session view prints.
+    #[must_use]
+    pub fn fleet_line(&self) -> Option<String> {
+        if self.targets.len() <= 1 {
+            return None;
+        }
+        Some(format!("fleet {}", self.targets.join(", ")))
+    }
+
+    /// Same phrase the authority will require for this fleet intent.
+    #[must_use]
+    pub fn fleet_confirmation_phrase(
+        &self,
+        action: mackes_mesh_types::lifecycle::LifecycleConfirmationAction,
+    ) -> String {
+        mackes_mesh_types::lifecycle::LifecycleConfirmationV1::expected_phrase(
+            action,
+            self.targets.len() as u32,
+        )
+    }
+
+    /// Same scope digest the authority binds to the signed phrase.
+    #[must_use]
+    pub fn fleet_scope_digest(&self) -> String {
+        mackes_mesh_types::lifecycle::LifecycleConfirmationV1::fleet_scope_digest(&self.targets)
+    }
+
+    /// Admit a coordinator handoff for this session. The durable generation
+    /// and target list stay the job; disconnecting the initiator cannot
+    /// invent a replacement fleet.
+    pub fn admit_fleet_handoff(
+        &self,
+        from_coordinator: &str,
+        to_coordinator: &str,
+    ) -> Result<FleetHandoffRequest, ProgressError> {
+        if self.targets.is_empty() {
+            return Err(ProgressError::OutOfScope);
+        }
+        if !coordinator_id_ok(from_coordinator) || !coordinator_id_ok(to_coordinator) {
+            return Err(ProgressError::Invalid("coordinator".into()));
+        }
+        if from_coordinator == to_coordinator {
+            return Err(ProgressError::Invalid("coordinator unchanged".into()));
+        }
+        if let Some(held) = self.coordinator_id.as_deref() {
+            if held != from_coordinator {
+                return Err(ProgressError::Invalid("coordinator mismatch".into()));
+            }
+        }
+        Ok(FleetHandoffRequest {
+            request_id: self.session_id.clone(),
+            generation: self.generation,
+            from_coordinator: from_coordinator.to_owned(),
+            to_coordinator: to_coordinator.to_owned(),
+            targets: self.targets.clone(),
+        })
+    }
+
+    /// Unsigned admission pins the artifact bytes, not the seat list.
+    #[must_use]
+    pub fn unsigned_scope_digest(artifact_digest_hex: &str) -> Option<String> {
+        if artifact_digest_hex.len() != 64
+            || !artifact_digest_hex.chars().all(|c| c.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        Some(artifact_digest_hex.to_owned())
     }
 
     /// Accept one authority progress acknowledgement for a target.
@@ -116,6 +235,23 @@ impl LifecycleController {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FleetHandoffRequest {
+    pub request_id: String,
+    pub generation: u64,
+    pub from_coordinator: String,
+    pub to_coordinator: String,
+    pub targets: Vec<String>,
+}
+
+fn coordinator_id_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_LIFECYCLE_IDENTIFIER_BYTES
+        && value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':'))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProgressError {
     Invalid(String),
     WrongSession,
@@ -140,7 +276,7 @@ mod tests {
 
     #[test]
     fn plans_are_identical_for_gui_and_tui_consumers() {
-        let controller =
+        let mut controller =
             LifecycleController::new("fleet-1", 7, vec!["b".into(), "a".into(), "a".into()]);
         let gui = controller.plan(LifecycleIntentKind::Offboard, "a").unwrap();
         let tui = controller.plan(LifecycleIntentKind::Offboard, "a").unwrap();
@@ -155,6 +291,97 @@ mod tests {
         assert!(controller
             .plan(LifecycleIntentKind::ResetAndOnboard, "missing")
             .is_none());
+        assert_eq!(
+            controller.fleet_confirmation_phrase(
+                mackes_mesh_types::lifecycle::LifecycleConfirmationAction::Offboard
+            ),
+            "FORCE OFFBOARD 2 SYSTEMS"
+        );
+        assert_eq!(
+            controller.fleet_scope_digest(),
+            mackes_mesh_types::lifecycle::LifecycleConfirmationV1::fleet_scope_digest(&["a", "b"])
+        );
+        let digest = "e".repeat(64);
+        assert_eq!(
+            controller.fleet_confirmation_phrase(
+                mackes_mesh_types::lifecycle::LifecycleConfirmationAction::InstallUnsigned
+            ),
+            "INSTALL UNSIGNED 2 SYSTEMS"
+        );
+        assert_eq!(
+            LifecycleController::unsigned_scope_digest(&digest).as_deref(),
+            Some(digest.as_str())
+        );
+        assert_ne!(
+            LifecycleController::unsigned_scope_digest(&digest).unwrap(),
+            controller.fleet_scope_digest()
+        );
+        assert!(LifecycleController::unsigned_scope_digest("not-a-digest").is_none());
+        let handoff = controller
+            .admit_fleet_handoff("coord-a", "coord-b")
+            .unwrap();
+        assert_eq!(handoff.request_id, "fleet-1");
+        assert_eq!(handoff.generation, 7);
+        assert_eq!(handoff.targets, vec!["a".to_owned(), "b".to_owned()]);
+        assert_eq!(
+            controller.admit_fleet_handoff("coord-a", "coord-a"),
+            Err(ProgressError::Invalid("coordinator unchanged".into()))
+        );
+        assert_eq!(
+            controller.admit_fleet_handoff("coord a", "coord-b"),
+            Err(ProgressError::Invalid("coordinator".into()))
+        );
+        controller.bind_coordinator(Some("coord-b".into())).unwrap();
+        assert_eq!(
+            controller.admit_fleet_handoff("coord-forged", "coord-c"),
+            Err(ProgressError::Invalid("coordinator mismatch".into()))
+        );
+        assert_eq!(
+            controller
+                .admit_fleet_handoff("coord-b", "coord-c")
+                .unwrap()
+                .to_coordinator,
+            "coord-c"
+        );
+    }
+
+    #[test]
+    fn from_fleet_report_binds_durable_scope_and_coordinator() {
+        let report = FleetLifecycleReportV1 {
+            schema_version: 1,
+            request_id: "request-1".into(),
+            generation: 1,
+            phase: LifecyclePhase::Running,
+            target_count: 2,
+            succeeded: 0,
+            failed: 0,
+            coordinator_id: "coord-b".into(),
+            signature_hex: String::new(),
+        };
+        let controller =
+            LifecycleController::from_fleet_report(&report, ["seat-16", "seat-15"]).unwrap();
+        assert_eq!(
+            controller.fleet_confirmation_phrase(
+                mackes_mesh_types::lifecycle::LifecycleConfirmationAction::Offboard
+            ),
+            "FORCE OFFBOARD 2 SYSTEMS"
+        );
+        assert_eq!(
+            controller.coordinator_line().as_deref(),
+            Some("coordinator coord-b")
+        );
+        assert_eq!(
+            controller.fleet_line().as_deref(),
+            Some("fleet seat-15, seat-16")
+        );
+        assert_eq!(
+            controller.admit_fleet_handoff("coord-forged", "coord-c"),
+            Err(ProgressError::Invalid("coordinator mismatch".into()))
+        );
+        assert!(
+            LifecycleController::from_fleet_report(&report, ["seat-15"]).is_err(),
+            "a renderer cannot shrink a durable fleet"
+        );
     }
 
     fn progress(

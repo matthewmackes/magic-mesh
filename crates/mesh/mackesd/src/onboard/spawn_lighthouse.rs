@@ -750,7 +750,34 @@ impl Provisioner for LiveProvisioner {
         }];
         self.remote_push
             .apply(&target, &actions)
-            .map_err(|e| remote_push_to_provision_error(e, endpoint))
+            .map_err(|e| remote_push_to_provision_error(e, endpoint))?;
+        if let Some(root) = self.workgroup_root.as_deref() {
+            let mut authority =
+                crate::lifecycle_authority::LifecycleAuthority::resume(root, &endpoint.host)
+                    .map_err(|error| ProvisionError::Failed {
+                        step: "push-enroll",
+                        reason: format!("resume lifecycle authority after enroll: {error:?}"),
+                    })?;
+            let confirm = authority.confirm_lighthouse_enrollment_bearer(root, bearer);
+            let release = authority.finish();
+            confirm.map_err(|error| ProvisionError::Failed {
+                step: "push-enroll",
+                reason: format!("confirm enrollment bearer: {error:?}"),
+            })?;
+            release.map_err(|error| ProvisionError::Failed {
+                step: "push-enroll",
+                reason: format!("release lifecycle authority: {error:?}"),
+            })?;
+            if let Some(overlay) = endpoint.overlay_ip.as_deref() {
+                crate::onboard::firstboot::pin_and_stage_mesh_join(root, overlay, None).map_err(
+                    |error| ProvisionError::Failed {
+                        step: "push-enroll",
+                        reason: format!("stage join dests: {error}"),
+                    },
+                )?;
+            }
+        }
+        Ok(())
     }
 
     fn migrate_ca(
@@ -1239,10 +1266,9 @@ mod tests {
         };
         assert_ne!(bearer, JOIN_TOKEN_PLACEHOLDER);
         assert!(!bearer.is_empty());
-        assert!(crate::bearer_ledger::is_pending(root.path(), bearer));
         assert!(
-            crate::bearer_ledger::is_lighthouse_bearer(root.path(), bearer),
-            "minted handoff must carry the lighthouse scope"
+            !crate::bearer_ledger::is_pending(root.path(), bearer),
+            "successful enroll must erase the ledger token"
         );
         assert!(
             !Action::RunEnroll {
@@ -1265,8 +1291,63 @@ mod tests {
         );
         assert!(
             checkpoint.contains("pending_enrollment_bearer_digests"),
-            "authority must record the minted-bearer digest"
+            "authority must keep the digest field"
         );
+        let value: serde_json::Value = serde_json::from_str(&checkpoint).unwrap();
+        assert_eq!(
+            value["pending_enrollment_bearer_digests"],
+            serde_json::json!([]),
+            "confirmed enroll must drop the pending digest"
+        );
+    }
+
+    #[test]
+    fn push_enroll_stages_join_dests_when_overlay_is_known() {
+        use crate::onboard::remote_push::{Action, RemotePush, RemotePushError, Target};
+        use std::sync::{Arc, Mutex};
+
+        #[derive(Default)]
+        struct RecordingPush {
+            seen: Mutex<Vec<Action>>,
+        }
+        impl RemotePush for RecordingPush {
+            fn apply(&self, _target: &Target, actions: &[Action]) -> Result<(), RemotePushError> {
+                self.seen
+                    .lock()
+                    .expect("seen mutex")
+                    .extend_from_slice(actions);
+                Ok(())
+            }
+        }
+
+        let root = tempfile::tempdir().expect("lifecycle root");
+        let push = Arc::new(RecordingPush::default());
+        let prov = LiveProvisioner::default()
+            .with_remote_push(push)
+            .with_workgroup_root(root.path().to_path_buf());
+        let endpoint = Endpoint {
+            host: "203.0.113.10".into(),
+            overlay_ip: Some("10.42.0.10".into()),
+            join_bearer: None,
+        };
+
+        prov.push_enroll(&endpoint, &enroll_bootstrap("home-deadbeef"))
+            .expect("signed overlay must stage join dests");
+        let dir = root.path().join("lifecycle");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(crate::onboard::firstboot::STAGED_OVERLAY_IP))
+                .unwrap()
+                .trim(),
+            "10.42.0.10"
+        );
+        assert!(
+            !dir.join(crate::onboard::firstboot::STAGED_ETCD_ENDPOINTS)
+                .exists(),
+            "lighthouse spawn must not invent workstation etcd-endpoints"
+        );
+        assert!(dir
+            .join(crate::onboard::firstboot::STAGED_GROUPED_PLANE)
+            .is_file());
     }
 
     #[test]

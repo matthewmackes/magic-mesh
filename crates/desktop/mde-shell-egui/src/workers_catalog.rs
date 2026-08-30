@@ -4,7 +4,7 @@
 //! Windows Settings-inspired category hierarchy.  This keeps scope visible and
 //! separates ordinary node/device controls from the advanced worker runtime.
 
-use crate::this_node_catalog::{page_index, PageEntry};
+use crate::this_node_catalog::{page_for_route, page_index, PageEntry};
 use crate::workbench::Plane;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +65,7 @@ impl CatalogGroup {
             Self::Home => "Health, attention, and the main control areas.",
             Self::ThisNode => "Hardware, settings, accounts, and lifecycle for this workstation.",
             Self::Mesh => "Topology, connectivity, and discovery across the mesh.",
-            Self::Fleet => "Nodes, fleet health, and provisioning.",
+            Self::Fleet => "Nodes and fleet health. Lifecycle mutation stays with mackesd.",
             Self::ConnectedDevices => "Phones, pairing, permissions, files, and services.",
             Self::Advanced => "Worker runtime, relations, history, and governed actions.",
             Self::SafePower => {
@@ -264,7 +264,9 @@ pub(crate) fn blurb(entry: CatalogEntry) -> &'static str {
         WorkersDestination::Network => "Mesh fabric, overlay routing, and network services.",
         WorkersDestination::Discovery => "Discovered mesh, LAN, and cloud units.",
         WorkersDestination::Fleet => "Roster, node health, and fleet rollup.",
-        WorkersDestination::Provisioning => "Onboarding, deployment, and join posture.",
+        WorkersDestination::Provisioning => {
+            "Onboarding and join posture. Lifecycle mutation stays on Updates & Lifecycle."
+        }
         WorkersDestination::Phones => "Paired phones and device permissions.",
         WorkersDestination::PhonePair => "Start a governed phone pairing.",
         WorkersDestination::PhoneFiles => "Files on a paired phone.",
@@ -367,5 +369,43 @@ mod tests {
                 .expect("displays"),
             "vitelity"
         ));
+    }
+
+    #[test]
+    fn updates_recovery_and_backup_share_the_lifecycle_section() {
+        for route in [
+            "this-node/updates",
+            "this-node/recovery-reset",
+            "this-node/backup-restore",
+        ] {
+            let page = page_for_route(route).expect(route);
+            assert_eq!(
+                page_section(page),
+                "Lifecycle",
+                "{route} must sit in the shared lifecycle section"
+            );
+        }
+    }
+
+    #[test]
+    fn provisioning_does_not_own_lifecycle_mutation() {
+        let provisioning = catalog()
+            .into_iter()
+            .find(|entry| entry.destination == WorkersDestination::Provisioning)
+            .expect("provisioning");
+        assert!(
+            blurb(provisioning).contains("Updates & Lifecycle"),
+            "Provisioning must send lifecycle mutation to the shared session"
+        );
+    }
+
+    #[test]
+    fn fleet_catalog_does_not_own_lifecycle_mutation() {
+        assert!(
+            CatalogGroup::Fleet
+                .description()
+                .contains("Lifecycle mutation stays with mackesd"),
+            "Fleet overview must not claim dest wipe or reset"
+        );
     }
 }
