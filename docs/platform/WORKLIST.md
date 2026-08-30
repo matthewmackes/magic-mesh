@@ -245,11 +245,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
-  Live DO promotion requires an admitted intent. Preflight argv now
-  refuses `REPLACE_*` leftovers. S3 dests stay parked; do not invent
-  dests or flip `production_admitted`. Evidence:
-  `WL-REL-007-2026-08-30-replace-refuse-r1.md`. Exact acceptance is
-  Dell, Seat 15, Surface, and three lighthouses.
+  Live DO, smoke, audit, and fd-soak require an admitted intent.
+  `REPLACE_*` argv refuses. S3 dests stay parked; do not invent dests
+  or flip `production_admitted`. Evidence:
+  `WL-REL-007-2026-08-30-live-intent-r1.md`. Exact acceptance is Dell,
+  Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      Complete: `automation/promotion/release-intent.py` validates

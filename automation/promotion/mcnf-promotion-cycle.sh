@@ -460,6 +460,7 @@ promote_eagle() {
 }
 
 live_smoke() {
+  require_admitted_release_intent
   log "Live mesh smoke"
   local bad_peers out
   if ! out="$(ssh -i "$SSH_KEY" -o BatchMode=yes -o StrictHostKeyChecking=accept-new root@165.227.188.238 \
@@ -573,6 +574,7 @@ audit_eagle() {
 }
 
 live_audit() {
+  require_admitted_release_intent
   log "Live fleet audit"
   check_limits
   for ip in $(do_lighthouse_ips); do
@@ -595,6 +597,7 @@ media_verify_for_cycle() {
 }
 
 live_fd_soak() {
+  require_admitted_release_intent
   log "Live fd/EMFILE soak"
   "$ROOT/automation/promotion/live-fd-soak.sh"
   record_gate fd-soak pass "duration=${MCNF_LIVE_FD_SOAK_SECONDS:-3600}s"
