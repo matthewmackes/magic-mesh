@@ -15,10 +15,10 @@ tasks.
   Beta is released).
   Operator 2026-08-28 skipped Construct Health Fix: do not fan or wait on a
   DRM Fix click; that leftover executes on `WL-TEST-003` only after the
-  Test Release. Dest-cut `bc14a22d7` is not that Beta. REL dest-operator
-  admission stays on Remaining REL epics. Do not invent a mesh-id or bearer.
-  Do not flip `production_admitted`. Unpublished `13.0.0-35` / lighthouse
-  `13.0.0-11` (`bc14a22d7`) remains installed on the dest-cut set.
+  Test Release. Dest-cut `bc14a22d7` is not that Beta. Operator 2026-08-30
+  authorized dest-operator admission of already-selected dests. Do not
+  invent a mesh-id, bearer, or missing dest. Unpublished `13.0.0-35` /
+  lighthouse `13.0.0-11` (`bc14a22d7`) remains installed on the dest-cut set.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Execution order:** lifecycle source is archived (`WL-FUNC-023`);
   record one clean pushed release-candidate revision and epoch
@@ -245,11 +245,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
-  Live DO, smoke, audit, and fd-soak require an admitted intent.
-  `REPLACE_*` argv refuses. S3 dests stay parked; do not invent dests
-  or flip `production_admitted`. Evidence:
-  `WL-REL-007-2026-08-30-live-intent-r1.md`. Exact acceptance is Dell,
-  Seat 15, Surface, and three lighthouses.
+  Operator 2026-08-30 authorized dest-operator admission of already-selected
+  dests. Maps mbtiles dest is on BigBoy; maps source-root dest is gone;
+  RPM secret is absent; Surface `bootc_base` stays null. Do not invent
+  dests. Evidence: `WL-REL-007-2026-08-30-operator-admit-r1.md`. Exact
+  acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      Complete: `automation/promotion/release-intent.py` validates
@@ -491,18 +491,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: S1 six-role inventory exists
-  (`WL-REL-006-2026-08-22-open-source-inventory-r1.md`; no Cuttlefish). Maps dest
-  `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles` on BigBoy sha256
-  `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`
-  (`production_admitted: false`). S3 App VM receipt bound to `aca7573bc`.
-  App VM, Browser VM, and bootc ARGs and inventory pins match `3a5e74e6…`.
-  Surface `bootc_base` stays null (blocked stack must not guess a digest).
-  Catalog choice is dest-backed Flathub LibreOffice (office guest), not a
-  parked ref. Evidence:
-  `WL-REL-006-2026-08-23-flathub-catalog-chosen-r1.md`. Leftover is Maps
-  `production_admitted`, RPM signer after freeze, S7 Maps/RPM `REPLACE_*`,
-  Surface `bootc_base` null. Do not flip `production_admitted`.
+- Current state: Operator 2026-08-30 authorized already-selected dests.
+  Maps dest remains BigBoy `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
+  sha256 `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`.
+  Catalog dest is Flathub LibreOffice. Bootc/App VM receipts exist under
+  `/root/mcnf-private/`. Maps source-root `/home/mm/mcnf-maps-sources` is
+  gone. RPM secret `06B1C27E…` is not on this host. Surface `bootc_base`
+  stays null on the blocked stack. S7 argv was not written. Evidence:
+  `WL-REL-007-2026-08-30-operator-admit-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -618,9 +614,9 @@ is a capacity incident (§10.0.3), not a silent retry.
        release-driver array from that object, and run release-input-preflight
        before any build mutation. Bootc `all-roles` receipt is now a private
        dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
-       argv object exists; App VM / Maps / RPM fields stay `REPLACE_*`.
-       The loader now refuses those placeholders. Template was not
-       overwritten. Do not claim preflight passed.
+       argv object exists. Operator 2026-08-30 authorized filling from
+       already-selected dests; maps source-root dest is gone and the RPM
+       secret is absent, so S7 argv was not written. Do not invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
