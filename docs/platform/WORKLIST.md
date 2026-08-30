@@ -245,10 +245,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
-  Live DO promotion now refuses without an admitted `ReleaseIntentV1`.
-  S3 / REL-006 dest-operator leftovers stay parked. Do not invent dests
-  or flip `production_admitted`. Evidence:
-  `WL-REL-007-2026-08-30-intent-require-r1.md`. Exact acceptance is
+  Live DO promotion requires an admitted intent. Preflight argv now
+  refuses `REPLACE_*` leftovers. S3 dests stay parked; do not invent
+  dests or flip `production_admitted`. Evidence:
+  `WL-REL-007-2026-08-30-replace-refuse-r1.md`. Exact acceptance is
   Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -619,7 +619,8 @@ is a capacity incident (§10.0.3), not a silent retry.
        before any build mutation. Bootc `all-roles` receipt is now a private
        dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
        argv object exists; App VM / Maps / RPM fields stay `REPLACE_*`.
-       Template was not overwritten. Do not claim preflight passed.
+       The loader now refuses those placeholders. Template was not
+       overwritten. Do not claim preflight passed.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs

@@ -164,6 +164,16 @@ def main() -> None:
             f"Cuttlefish object used a generic refusal: {cuttlefish.stderr}",
         )
 
+        placeholder_value = dict(document)
+        placeholder_value["maps_mbtiles"] = "REPLACE_MAPS_MBTILES"
+        placeholder = publish("placeholder.json", placeholder_value)
+        placeholder_result = invoke(loader, placeholder)
+        check(placeholder_result.returncode == 2, "REPLACE_* leftover was accepted")
+        check(
+            "REPLACE_" in placeholder_result.stderr,
+            f"REPLACE_* leftover used a generic refusal: {placeholder_result.stderr}",
+        )
+
         raw_digest = dict(document)
         raw_digest["bootc_base_digest"] = "sha256:" + "4" * 64
         raw = publish("raw-digest.json", raw_digest)

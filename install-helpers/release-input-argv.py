@@ -187,6 +187,10 @@ def validate(document: dict[str, object]) -> dict[str, str | list[str]]:
     values: dict[str, str | list[str]] = {}
     for field in SCALAR_FIELDS:
         values[field] = bounded_string(document[field], field)
+        if "REPLACE_" in str(values[field]):
+            raise Refusal(
+                f"{field} still contains REPLACE_*; dest-operator leftover is not a release input"
+            )
     for field in PATH_FIELDS:
         values[field] = validate_path(document[field], field, field == "maps_tile_source_root")
 
