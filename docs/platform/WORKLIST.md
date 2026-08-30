@@ -246,9 +246,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
   Operator 2026-08-30 authorized dest-operator admission of already-selected
-  dests. Maps mbtiles dest is on BigBoy; maps source-root dest is gone;
-  RPM secret is absent; Surface `bootc_base` stays null. Do not invent
-  dests. Evidence: `WL-REL-007-2026-08-30-operator-admit-r1.md`. Exact
+  dests. Maps mbtiles dest is on BigBoy; maps source-root dest is restored
+  on BigBoy `/home/mm/mcnf-maps-sources`. RPM identity receipt is bound to
+  `ba1726ffa` / `1788132281` at `/root/mcnf-private/rpm-signing-identity.json`
+  (secret lives on BigBoy, not this host). Surface `bootc_base` stays null.
+  S7 argv was not written. Evidence:
+  `WL-REL-007-2026-08-30-maps-source-rpm-r1.md`. Exact
   acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -496,9 +499,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   sha256 `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`.
   Catalog dest is Flathub LibreOffice. Bootc/App VM receipts exist under
   `/root/mcnf-private/`. Maps source-root `/home/mm/mcnf-maps-sources` is
-  gone. RPM secret `06B1C27E…` is not on this host. Surface `bootc_base`
-  stays null on the blocked stack. S7 argv was not written. Evidence:
-  `WL-REL-007-2026-08-30-operator-admit-r1.md`.
+  restored on BigBoy (TIGER sha matches 2026-08-22; Geofabrik latest
+  moved). RPM identity receipt is bound to `ba1726ffa` /
+  `1788132281`. Surface `bootc_base` stays null on the blocked stack. S7
+  argv was not written (cross-revision App/bootc receipts + `REPLACE_*`).
+  Evidence: `WL-REL-007-2026-08-30-maps-source-rpm-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -615,8 +620,10 @@ is a capacity incident (§10.0.3), not a silent retry.
        before any build mutation. Bootc `all-roles` receipt is now a private
        dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
        argv object exists. Operator 2026-08-30 authorized filling from
-       already-selected dests; maps source-root dest is gone and the RPM
-       secret is absent, so S7 argv was not written. Do not invent dests.
+       already-selected dests. Maps source-root dest is restored and the
+       RPM identity receipt is bound to `ba1726ffa`. S7 argv was not
+       written: App/bootc receipts are still cross-revision and Surface
+       `bootc_base` stays null. Do not invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
