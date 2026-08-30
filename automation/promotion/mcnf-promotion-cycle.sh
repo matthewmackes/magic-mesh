@@ -687,9 +687,21 @@ EOF
 EOF
 }
 
+require_admitted_release_intent() {
+  local revision intent
+  revision="$(git -C "$ROOT" rev-parse HEAD 2>/dev/null || true)"
+  [ -n "$revision" ] || die "live promotion needs a current source revision"
+  intent="${MCNF_RELEASE_INTENT:-/var/lib/mcnf-release/${revision}/intent.json}"
+  python3 "$ROOT/automation/promotion/release-intent.py" \
+    --require-admitted "$intent" \
+    --repo "$ROOT" \
+    || die "live promotion requires an admitted ReleaseIntentV1 for $revision"
+}
+
 promote_do() {
   check_limits
   [ "${MCNF_ARM_LIVE:-0}" = 1 ] || die "set MCNF_ARM_LIVE=1 to promote to live DO lighthouses"
+  require_admitted_release_intent
   RPM="$(latest_rpm)"; [ -f "$RPM" ] || die "no RPM; run build first"
   log "Promote live DO lighthouses in-place"
   publish_promote build "$(rpm_version_token "$RPM")" ready "candidate"

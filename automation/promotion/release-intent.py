@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import subprocess
 import sys
 import tempfile
 from pathlib import Path
@@ -188,6 +189,29 @@ def cas_state(path: Path, incoming: dict[str, object], intent: dict[str, object]
     return stored
 
 
+def current_revision(repo: Path) -> str:
+    try:
+        head = subprocess.check_output(
+            ["git", "-C", str(repo), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.DEVNULL,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as exc:
+        refuse(f"current source revision is unavailable: {exc}")
+    if not REVISION.fullmatch(head):
+        refuse("current source revision is not a 40-character lowercase hex SHA")
+    return head
+
+
+def require_admitted(path: Path, repo: Path | None) -> dict[str, object]:
+    obj = validate_intent(load_object(path))
+    if obj.get("admitted") is not True:
+        refuse("live promotion requires an admitted signed ReleaseIntentV1")
+    if repo is not None and obj["source_revision"] != current_revision(repo):
+        refuse("intent source_revision does not match the current checkout")
+    return obj
+
+
 def write_json(path: Path, obj: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     tmp = path.with_suffix(path.suffix + ".tmp")
@@ -260,6 +284,20 @@ def self_test() -> None:
             pass
         else:
             refuse("unadmitted pass must refuse")
+        draft_path = Path(tmp) / "draft.json"
+        write_json(draft_path, intent)
+        try:
+            require_admitted(draft_path, None)
+        except Refusal:
+            pass
+        else:
+            refuse("unadmitted draft must refuse live require")
+        signed = dict(intent)
+        signed["admitted"] = True
+        signed["signature"] = "ab" * 32
+        signed_path = Path(tmp) / "signed.json"
+        write_json(signed_path, signed)
+        require_admitted(signed_path, None)
     print("release-intent: ALL PASS")
 
 
@@ -267,6 +305,8 @@ def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--self-test", action="store_true")
     parser.add_argument("--validate-intent")
+    parser.add_argument("--require-admitted")
+    parser.add_argument("--repo")
     parser.add_argument("--write-draft")
     parser.add_argument("--source-revision")
     parser.add_argument("--epoch")
@@ -280,6 +320,13 @@ def main(argv: list[str]) -> int:
             validate_intent(load_object(Path(args.validate_intent)))
             print("release-intent: PASS: intent")
             return 0
+        if args.require_admitted:
+            require_admitted(
+                Path(args.require_admitted),
+                Path(args.repo) if args.repo else None,
+            )
+            print("release-intent: PASS: admitted")
+            return 0
         if args.write_draft:
             if not args.source_revision or not args.epoch or not args.credential_name:
                 refuse("write-draft needs --source-revision, --epoch, and --credential-name")
@@ -289,7 +336,7 @@ def main(argv: list[str]) -> int:
             )
             print(f"release-intent: PASS: wrote unadmitted draft to {args.write_draft}")
             return 0
-        refuse("choose --self-test, --validate-intent, or --write-draft")
+        refuse("choose --self-test, --validate-intent, --require-admitted, or --write-draft")
     except Refusal as exc:
         print(f"release-intent: REFUSE: {exc}", file=sys.stderr)
         return 2

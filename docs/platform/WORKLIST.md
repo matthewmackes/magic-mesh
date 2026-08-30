@@ -244,11 +244,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   qualify, publish, read back, and archive production
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
-- Current state: `WL-FUNC-023` archived 2026-08-30. S1 contracts and S4
-  Android deferral projection landed. S3 / REL-006 dest-operator leftovers
-  stay parked. Unpublished `13.0.0-35` is dest-cut, not a testing Beta.
-  Do not invent dests or flip `production_admitted`. Evidence:
-  `WL-REL-007-2026-08-30-android-deferred-r1.md`. Exact acceptance is
+- Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
+  Live DO promotion now refuses without an admitted `ReleaseIntentV1`.
+  S3 / REL-006 dest-operator leftovers stay parked. Do not invent dests
+  or flip `production_admitted`. Evidence:
+  `WL-REL-007-2026-08-30-intent-require-r1.md`. Exact acceptance is
   Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -256,8 +256,9 @@ is a capacity incident (§10.0.3), not a silent retry.
      `ReleaseIntentV1`/`ReleaseStateV1`; drafts stay unadmitted;
      Cuttlefish, invented dests, and `production_admitted` flips refuse.
      Journal receipts remain `release-stage-journal.sh`. Evidence:
-     `WL-REL-007-2026-08-30-release-intent-r1.md`. Signed admission on
-     protected `master` stays dest-operator leftover.
+     `WL-REL-007-2026-08-30-release-intent-r1.md`. Live `do` now requires
+     an admitted intent; the signed dest on protected `master` stays
+     dest-operator leftover.
   2. S2 Complete the unified lifecycle under WL-FUNC-023.
      Complete: archived 2026-08-30. Official `cargo test -p mackesd` passed
      5187/0/1 at `519c415bc`. Evidence:
