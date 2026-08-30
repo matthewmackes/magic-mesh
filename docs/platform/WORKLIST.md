@@ -244,35 +244,21 @@ is a capacity incident (§10.0.3), not a silent retry.
   qualify, publish, read back, and archive production
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
-- Current state: `WL-FUNC-023` archived 2026-08-30 (official `mackesd`
-  5187/0/1 at `519c415bc`). Live leftovers stay on `WL-TEST-003`.
-  WL-REL-006 is parked (freeze / catalog refs / RPM secret). Unpublished
-  `13.0.0-35` is dest-cut, not a testing Beta. Surface is approved;
-  Android/Cuttlefish is deferred. `WL-FUNC-033` archived 2026-08-24.
-  Do not grind `cargo test --workspace` as filler. Evidence:
-  `WL-REL-007-2026-08-22-coordinator-park-r1.md`. Exact acceptance is Dell,
-  Seat 15, Surface, and three lighthouses.
+- Current state: `WL-FUNC-023` archived 2026-08-30. S1 contracts landed
+  (`ReleaseIntentV1`/`ReleaseStateV1`; unadmitted drafts only).
+  WL-REL-006 dest-operator leftovers stay parked. Unpublished
+  `13.0.0-35` is dest-cut, not a testing Beta. Do not invent dests or
+  flip `production_admitted`. Do not grind `cargo test --workspace`.
+  Evidence: `WL-REL-007-2026-08-30-release-intent-r1.md`. Exact
+  acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
-     - Inputs: this worklist, governance locks, farm topology, the eight owning
-       epics, and the clean integration branch.
-     - Action: keep one integration authority and use two to five workers
-       only for disjoint lifecycle, surfaces, inputs, infrastructure, and release
-       scopes. `WL-FUNC-023` is archived; establish the `WL-REL-001` S1 candidate
-       identity; execute `WL-REL-006` against it; reconfirm and finalize
-       `WL-REL-001`; then execute `WL-REL-002`, `WL-REL-003`, a testing Beta,
-       `WL-REL-004`, `WL-REL-005`; live/operator leftover is `WL-TEST-003`
-       after that Beta, not a pre-Beta fan-out.
-     - Deliverable: strict signed `ReleaseIntentV1`, `ReleaseStateV1`, and
-       `ReleaseStageReceiptV1` contracts plus a restart-safe stage journal under
-       `/var/lib/mcnf-release/<revision>/` binding version, source, six roles,
-       six targets, credential names, destructive scope, retries, and
-       input/output hashes; this journal is execution state, not a worklist.
-     - Validation: every worker has a disjoint write scope; every mutation and
-       gate maps to one owning story; compare-and-swap stage receipts resume
-       after interruption; no parallel tracker or filler farm job is created.
-     - Done when: every ready story has one owner and no downstream story starts
-       before its dependencies are green.
+     Complete: `automation/promotion/release-intent.py` validates
+     `ReleaseIntentV1`/`ReleaseStateV1`; drafts stay unadmitted;
+     Cuttlefish, invented dests, and `production_admitted` flips refuse.
+     Journal receipts remain `release-stage-journal.sh`. Evidence:
+     `WL-REL-007-2026-08-30-release-intent-r1.md`. Signed admission on
+     protected `master` stays dest-operator leftover.
   2. S2 Complete the unified lifecycle under WL-FUNC-023.
      Complete: archived 2026-08-30. Official `cargo test -p mackesd` passed
      5187/0/1 at `519c415bc`. Evidence:
