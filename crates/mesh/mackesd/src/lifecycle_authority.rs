@@ -224,10 +224,9 @@ fn declared_step_allows_blocked_progress(checkpoint: &LifecycleCheckpointV1) -> 
             matches!(step.as_str(), "mesh" | "configuration") && !final_verify
         }
         LifecycleIntentKind::Upgrade => {
-            matches!(
-                step.as_str(),
-                "packages" | "mesh" | "configuration" | "verify"
-            ) && !final_verify
+            let packages_pinned = step == "packages" && checkpoint.artifact_selection.is_some();
+            (packages_pinned || matches!(step.as_str(), "mesh" | "configuration" | "verify"))
+                && !final_verify
         }
         _ => false,
     }
