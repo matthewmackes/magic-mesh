@@ -246,15 +246,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
   Operator 2026-08-30 authorized dest-operator admission of already-selected
-  dests. Maps mbtiles dest is on BigBoy; maps source-root dest is restored.
-  RPM / App catalog / App VM receipts were rebound to `54ee58acf` /
-  `1788132485`. Selected bootc dest `3a5e74e6…` is gone from quay; the
-  moved `:44` digest was not adopted and is not cached on the farm.
-  Bootc receipt produce now refuses tag-only / mismatched pins. Maps
-  offline-catalog dest was derived from the dest MBTiles tiles. S7 argv
-  was not written: selected bootc dest is gone, the rust catalog
-  verifier binary is not dest'd, and Surface `bootc_base` stays null.
-  Evidence: `WL-REL-007-2026-08-30-maps-offline-catalog-r1.md`. Exact
+  dests. Maps dest and dest-derived offline catalog are on BigBoy; the
+  rust verifier dest admits that bundle. RPM / App catalog / App VM
+  receipts rebound to `54ee58acf`. Selected bootc dest `3a5e74e6…` is
+  gone from quay/farm; produce refuses tag-only pins. S7 argv was not
+  written: bootc dest gone, Surface `bootc_base` stays null. Evidence:
+  `WL-REL-007-2026-08-30-maps-catalog-verify-r1.md`. Exact
   acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -502,10 +499,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   Flathub LibreOffice. RPM / App catalog / App VM receipts rebound to
   `54ee58acf`. Selected bootc dest `3a5e74e6…` is gone from quay/farm;
   produce now refuses tag-only pins. Maps offline-catalog dest exists
-  from dest MBTiles tiles. S7 argv was not written: bootc dest gone,
-  `verify-offline-map-catalog` is not dest'd, Surface `bootc_base`
-  stays null. Evidence:
-  `WL-REL-007-2026-08-30-maps-offline-catalog-r1.md`.
+  from dest MBTiles tiles and the rust verifier dest admits that
+  bundle. S7 argv was not written: bootc dest `3a5e74e6…` is gone and
+  Surface `bootc_base` stays null. Evidence:
+  `WL-REL-007-2026-08-30-maps-catalog-verify-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -625,9 +622,9 @@ is a capacity incident (§10.0.3), not a silent retry.
        already-selected dests. Maps source-root dest is restored. RPM /
        App catalog / App VM receipts are rebound to `54ee58acf`. S7 argv
        was not written: selected bootc dest `3a5e74e6…` is gone from
-       quay and the farm, `verify-offline-map-catalog` is not dest'd,
-       and Surface `bootc_base` stays null. Maps offline-catalog dest
-       now exists from dest MBTiles tiles. Do not invent dests.
+       quay and the farm, and Surface `bootc_base` stays null. Maps
+       offline-catalog dest and `verify-offline-map-catalog` dest now
+       admit the dest MBTiles tiles. Do not invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
