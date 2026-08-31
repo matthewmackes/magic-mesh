@@ -498,18 +498,13 @@ is a capacity incident (§10.0.3), not a silent retry.
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
 - Current state: Operator 2026-08-30 authorized already-selected dests.
-  Maps dest remains BigBoy `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
-  sha256 `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`.
-  Catalog dest is Flathub LibreOffice. Bootc/App VM receipts exist under
-  `/root/mcnf-private/`. Maps source-root is restored. RPM / App catalog /
-  App VM receipts are rebound to `54ee58acf`. Selected bootc dest
-  `3a5e74e6…` is no longer on quay; the moved `:44` digest was not
-  adopted and is not cached on the farm. Bootc receipt produce now
-  refuses tag-only / mismatched pins. Maps offline-catalog dest now
-  exists from dest MBTiles tiles (`maps-offline-approval-f8dce4e0c.json`
-  + BigBoy bundle). S7 argv was not written: bootc dest `3a5e74e6…` is
-  gone, `verify-offline-map-catalog` is not dest'd, and Surface
-  `bootc_base` stays null. Evidence:
+  Maps dest is BigBoy `buffalo-niagara.mbtiles` `6d01a543…`. Catalog is
+  Flathub LibreOffice. RPM / App catalog / App VM receipts rebound to
+  `54ee58acf`. Selected bootc dest `3a5e74e6…` is gone from quay/farm;
+  produce now refuses tag-only pins. Maps offline-catalog dest exists
+  from dest MBTiles tiles. S7 argv was not written: bootc dest gone,
+  `verify-offline-map-catalog` is not dest'd, Surface `bootc_base`
+  stays null. Evidence:
   `WL-REL-007-2026-08-30-maps-offline-catalog-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
