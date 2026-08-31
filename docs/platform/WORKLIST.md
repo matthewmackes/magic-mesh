@@ -396,13 +396,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   on the protected default branch and bind every release input, version surface,
   note, and tag plan to it.
 - Current state: frozen source is 42035dcbd76b03b8323399892052b21a96e2e233
-  epoch 1788153988 on protected `master`. S7 preflight passed at that
-  SHA. S4 notes name that revision. S2 13.0.0 metadata remains
-  `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
-  2026-08-23 matrix. Brand epoch `13` maps to Construct. Drain-branch
-  docs after dest-cut are not the freeze tree. GitHub Actions was
-  disabled (queued freeze dispatches had zero jobs). Dest-operator
-  enablement plus runner `mcnf-farm` started freeze-SHA CI
+  epoch 1788153988 on protected `master`. S7 preflight passed; S4 notes
+  name that revision. S2 13.0.0 metadata remains the 2026-08-16 farm
+  matrix. Drain-branch docs after dest-cut are not the freeze tree.
+  GitHub Actions was disabled (queued freeze dispatches had zero jobs).
+  Dest-operator enablement plus runner `mcnf-farm` started freeze-SHA CI
   `https://github.com/matthewmackes/magic-mesh/actions/runs/33398044275`
   (`in_progress`, not yet pass). Evidence:
   `WL-REL-001-2026-08-31-github-required-unblocked-r1.md`. Do not tag or
