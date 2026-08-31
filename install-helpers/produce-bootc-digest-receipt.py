@@ -20,6 +20,7 @@ EXIT_REFUSED = 2
 MAX_REGISTRY_DOCUMENT = 16 * 1024 * 1024
 MAX_RECEIPT = 8192
 DIGEST_RE = re.compile(r"sha256:[0-9a-f]{64}")
+IMAGE_REFERENCE_RE = re.compile(r"[^@\s]+@sha256:[0-9a-f]{64}\Z")
 REVISION_RE = re.compile(r"[0-9a-f]{40}|[0-9a-f]{64}")
 ARCH_RE = re.compile(r"[a-z0-9][a-z0-9_.-]{0,31}")
 ROLE_RE = re.compile(r"[a-z0-9][a-z0-9-]{0,63}")
@@ -85,6 +86,8 @@ def validate_identity(reference: str, architecture: str, role: str) -> None:
         raise Refusal("image reference is empty, overlong, or contains unsafe characters")
     if reference.startswith("docker://"):
         raise Refusal("image reference must omit the transport prefix")
+    if not IMAGE_REFERENCE_RE.fullmatch(reference):
+        raise Refusal("bootc image reference must be digest-pinned")
     if not ARCH_RE.fullmatch(architecture):
         raise Refusal("architecture is invalid")
     if not ROLE_RE.fullmatch(role):
@@ -131,6 +134,9 @@ def document(repo: Path, skopeo: str, reference: str, architecture: str, revisio
     validate_identity(reference, architecture, role)
     revision, commit_epoch = validate_release(repo, revision, epoch)
     digest, media_type = resolve(skopeo, reference, architecture)
+    pinned = reference.rsplit("@", 1)[1]
+    if digest != pinned:
+        raise Refusal("bootc reference digest does not match registry manifest bytes")
     return {
         "schema_version": 1,
         "kind": "mcnf-bootc-image-digest",

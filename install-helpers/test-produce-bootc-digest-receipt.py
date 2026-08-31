@@ -2,7 +2,7 @@
 """Hostile self-test for immutable bootc digest receipt production."""
 
 from __future__ import annotations
-import json, os, stat, subprocess, sys, tempfile
+import hashlib, json, os, stat, subprocess, sys, tempfile
 from pathlib import Path
 
 TOOL = Path(__file__).with_name("produce-bootc-digest-receipt.py")
@@ -31,12 +31,15 @@ def main() -> None:
         fake.chmod(0o755)
         receipt = root / "receipt.json"
         base = ("--repo",str(repo),"--skopeo",str(fake))
-        produce = ("produce","--image-reference","registry.invalid/mcnf/bootc:release","--architecture","amd64","--source-revision",revision,"--commit-epoch","1700000000","--release-role","all-roles","--output",str(receipt))
+        pin = "sha256:" + hashlib.sha256(manifest.encode()).hexdigest()
+        reference = f"registry.invalid/mcnf/bootc:release@{pin}"
+        produce = ("produce","--image-reference",reference,"--architecture","amd64","--source-revision",revision,"--commit-epoch","1700000000","--release-role","all-roles","--output",str(receipt))
         call(*base,*produce)
         assert stat.S_IMODE(receipt.stat().st_mode) == 0o400
         value = json.loads(receipt.read_text())
-        assert value["resolved_digest"] == "sha256:" + __import__("hashlib").sha256(manifest.encode()).hexdigest()
-        inspect = ("inspect","--receipt",str(receipt),"--expected-image-reference","registry.invalid/mcnf/bootc:release","--expected-architecture","amd64","--expected-source-revision",revision,"--expected-commit-epoch","1700000000","--expected-release-role","all-roles")
+        assert value["resolved_digest"] == pin
+        assert value["image_reference"] == reference
+        inspect = ("inspect","--receipt",str(receipt),"--expected-image-reference",reference,"--expected-architecture","amd64","--expected-source-revision",revision,"--expected-commit-epoch","1700000000","--expected-release-role","all-roles")
         call(*base,*inspect)
         call(*base,*produce,ok=False)  # no replacement
         call(*base,*inspect[:-1],"foreign-role",ok=False)
@@ -62,6 +65,18 @@ def main() -> None:
         failing = root / "failing"; failing.write_text("#!/bin/sh\necho registry-unavailable >&2\nexit 1\n"); failing.chmod(0o755)
         call("--repo",str(repo),"--skopeo",str(failing),*produce[:-1],str(root/"unavailable.json"),ok=False)
         assert not (root/"unavailable.json").exists()
+        tag_only = list(produce)
+        tag_only[tag_only.index("--image-reference") + 1] = "registry.invalid/mcnf/bootc:release"
+        tag_only[-1] = str(root / "tag-only.json")
+        tagged = call(*base, *tag_only, ok=False)
+        assert "digest-pinned" in tagged.stderr
+        assert not Path(tag_only[-1]).exists()
+        wrong = list(produce)
+        wrong[wrong.index("--image-reference") + 1] = "registry.invalid/mcnf/bootc:release@sha256:" + "c" * 64
+        wrong[-1] = str(root / "wrong-pin.json")
+        mismatched = call(*base, *wrong, ok=False)
+        assert "does not match" in mismatched.stderr
+        assert not Path(wrong[-1]).exists()
     print("bootc digest receipt hostile self-test: PASS")
 
 if __name__ == "__main__": main()
