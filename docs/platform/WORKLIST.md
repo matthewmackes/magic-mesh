@@ -247,8 +247,11 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
   Operator 2026-08-30 authorized dest-operator admission of already-selected
   dests. S7 argv and `release-input-preflight` passed at `42035dcbd`
-  (same dests as `73828796f`). Not freeze. Evidence:
-  `WL-REL-007-2026-08-31-s7-preflight-42035dcbd-r1.md`. Exact
+  (same dests as `73828796f`). Drain HEAD after that SHA is docs-only
+  (`CHANGELOG.md`, worklist, notes, evidence). Do not rebind dests for
+  that delta. Not freeze. Evidence:
+  `WL-REL-007-2026-08-31-s7-preflight-42035dcbd-r1.md` and
+  `WL-REL-001-2026-08-31-docs-delta-reconfirm-r1.md`. Exact
   acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -394,16 +397,16 @@ is a capacity incident (§10.0.3), not a silent retry.
   note, and tag plan to it.
 - Current state: dest-cut SHA is 42035dcbd76b03b8323399892052b21a96e2e233
   epoch 1788153988. S7 `release-input-preflight` passed at that revision.
+  Drain HEAD is docs-only from that dest-cut; do not rebind dests.
   Unpublished signed dest remains bound; this is not the final freeze.
   Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
   `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
   2026-08-23 matrix (`WL-REL-001-2026-08-23-version-matrix-r1.md`;
   `check-release-version-surfaces.sh` PASS). Brand epoch `13` maps to
   Construct (`WL-REL-001-2026-08-23-construct-epoch-13-r1.md`; farm
-  `mde-theme` `22/22`). Live FUNC-023 enroll leftover is `WL-TEST-003`
-  after a testing Beta. S4 notes draft is
-  `docs/releases/magic-mesh-v13.0.0.md`. Final freeze still needs dest-cut
-  SHA reconfirmation. Do not declare freeze until that leftover closes.
+  `mde-theme` `22/22`). S4 notes: `docs/releases/magic-mesh-v13.0.0.md`.
+  Evidence: `WL-REL-001-2026-08-31-docs-delta-reconfirm-r1.md`. Do not
+  declare freeze until dest-operator leftover closes.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded. Live FUNC-023 enroll
      leftover is WL-TEST-003 after a testing Beta: 2872293b1 / 1787447942 is
@@ -498,8 +501,10 @@ is a capacity incident (§10.0.3), not a silent retry.
   produce now refuses tag-only pins. Maps offline-catalog dest exists
   from dest MBTiles tiles and the rust verifier dest admits that
   bundle. S7 argv and `release-input-preflight` passed at `42035dcbd`.
+  Later drain HEAD is docs-only; do not rebind dests for that delta.
   Not freeze. Evidence:
-  `WL-REL-007-2026-08-31-s7-preflight-42035dcbd-r1.md`.
+  `WL-REL-007-2026-08-31-s7-preflight-42035dcbd-r1.md` and
+  `WL-REL-001-2026-08-31-docs-delta-reconfirm-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
