@@ -250,9 +250,11 @@ is a capacity incident (§10.0.3), not a silent retry.
   RPM / App catalog / App VM receipts were rebound to `54ee58acf` /
   `1788132485`. Selected bootc dest `3a5e74e6…` is gone from quay; the
   moved `:44` digest was not adopted and is not cached on the farm.
-  Bootc receipt produce now refuses tag-only / mismatched pins. Surface
-  `bootc_base` stays null. S7 argv was not written. Evidence:
-  `WL-REL-007-2026-08-30-bootc-digest-pin-r1.md`. Exact
+  Bootc receipt produce now refuses tag-only / mismatched pins. Maps
+  offline-catalog dest was derived from the dest MBTiles tiles. S7 argv
+  was not written: selected bootc dest is gone, the rust catalog
+  verifier binary is not dest'd, and Surface `bootc_base` stays null.
+  Evidence: `WL-REL-007-2026-08-30-maps-offline-catalog-r1.md`. Exact
   acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -503,10 +505,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   App VM receipts are rebound to `54ee58acf`. Selected bootc dest
   `3a5e74e6…` is no longer on quay; the moved `:44` digest was not
   adopted and is not cached on the farm. Bootc receipt produce now
-  refuses tag-only / mismatched pins. Maps dest approval is still the
-  `ab4a9d554` MBTiles sidecar, not an offline-catalog tile approval.
-  Surface `bootc_base` stays null. S7 argv was not written. Evidence:
-  `WL-REL-007-2026-08-30-bootc-digest-pin-r1.md`.
+  refuses tag-only / mismatched pins. Maps offline-catalog dest now
+  exists from dest MBTiles tiles (`maps-offline-approval-f8dce4e0c.json`
+  + BigBoy bundle). S7 argv was not written: bootc dest `3a5e74e6…` is
+  gone, `verify-offline-map-catalog` is not dest'd, and Surface
+  `bootc_base` stays null. Evidence:
+  `WL-REL-007-2026-08-30-maps-offline-catalog-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -626,8 +630,9 @@ is a capacity incident (§10.0.3), not a silent retry.
        already-selected dests. Maps source-root dest is restored. RPM /
        App catalog / App VM receipts are rebound to `54ee58acf`. S7 argv
        was not written: selected bootc dest `3a5e74e6…` is gone from
-       quay and the farm, Maps still lacks an offline-catalog tile
-       approval, and Surface `bootc_base` stays null. Do not invent dests.
+       quay and the farm, `verify-offline-map-catalog` is not dest'd,
+       and Surface `bootc_base` stays null. Maps offline-catalog dest
+       now exists from dest MBTiles tiles. Do not invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
