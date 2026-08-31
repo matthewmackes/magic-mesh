@@ -1,8 +1,11 @@
 # magic-mesh-v13.0.0
 
 Tag plan: `magic-mesh-v13.0.0`. Version: `13.0.0`. Fedora 44, x86_64.
-This is the versioned release-note source for `WL-REL-001` S4. It is **not**
-the final freeze, a public publication, or a live-seat pass.
+Frozen source: `42035dcbd76b03b8323399892052b21a96e2e233` epoch
+`1788153988` on protected `master`. This is the `WL-REL-001` S4 note
+source for that revision. It is not a public publication, tag, or
+live-seat pass. Drain-branch documentation after the freeze SHA is not
+the freeze tree.
 
 ## What ships
 
@@ -35,12 +38,12 @@ only daemon authority; `mde-bus` is the only platform bus.
 - Live-seat, provider, and operator-testing leftovers execute on
   `WL-TEST-003` only after a testing Beta. Dest-cut
   `bc14a22d7` (`13.0.0-35` / lighthouse `13.0.0-11`) is not that Beta.
-- Surface `packaging/surface/surface-stack.f44.json` `bootc_base` stays
-  null while that stack is blocked. Do not guess a digest.
-- First-release input preflight passed at `42035dcbd` /
-  `1788153988` against already-selected dests. Recording later evidence
-  moves HEAD; final freeze still requires dest-cut reconfirmation of one
-  unchanged revision.
+- Surface `packaging/surface/surface-stack.f44.json` stays blocked
+  (unsigned Surface RPMs). The selected bootc dest pin is private
+  `quay.io/fedora/fedora-bootc@sha256:3a5e74e6…`; in-tree `bootc_base`
+  remains null.
+- `github-required` is now a required check on `master`. The freeze-SHA
+  workflow was dispatched and has not yet passed.
 
 ## Upgrade path
 

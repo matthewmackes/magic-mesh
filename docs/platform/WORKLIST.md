@@ -245,14 +245,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
-  Operator 2026-08-30 authorized dest-operator admission of already-selected
-  dests. S7 argv and `release-input-preflight` passed at `42035dcbd`
-  (same dests as `73828796f`). Drain HEAD after that SHA is docs-only
-  (`CHANGELOG.md`, worklist, notes, evidence). Do not rebind dests for
-  that delta. Not freeze. Evidence:
-  `WL-REL-007-2026-08-31-s7-preflight-42035dcbd-r1.md` and
-  `WL-REL-001-2026-08-31-docs-delta-reconfirm-r1.md`. Exact
-  acceptance is Dell, Seat 15, Surface, and three lighthouses.
+  Operator 2026-08-31 authorized dest-cut freeze. Protected `master` is
+  `42035dcbd` / `1788153988`. S7 preflight passed at that SHA. Maps dest
+  operator-admitted. Surface dest pin is private selected `3a5e74e6…`;
+  in-tree stack stays blocked. `github-required` is required on `master`;
+  freeze-SHA CI is dispatched, not yet pass. Drain docs after dest-cut
+  are not the freeze tree. Evidence:
+  `WL-REL-001-2026-08-31-source-freeze-r1.md`. Exact acceptance is Dell,
+  Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      Complete: `automation/promotion/release-intent.py` validates
@@ -395,25 +395,22 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit
   on the protected default branch and bind every release input, version surface,
   note, and tag plan to it.
-- Current state: dest-cut SHA is 42035dcbd76b03b8323399892052b21a96e2e233
-  epoch 1788153988. S7 `release-input-preflight` passed at that revision.
-  Drain HEAD is docs-only from that dest-cut; do not rebind dests.
-  Unpublished signed dest remains bound; this is not the final freeze.
-  Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
+- Current state: frozen source is 42035dcbd76b03b8323399892052b21a96e2e233
+  epoch 1788153988 on protected `master`. S7 preflight passed at that
+  SHA. S4 notes name that revision. S2 13.0.0 metadata remains
   `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
-  2026-08-23 matrix (`WL-REL-001-2026-08-23-version-matrix-r1.md`;
-  `check-release-version-surfaces.sh` PASS). Brand epoch `13` maps to
-  Construct (`WL-REL-001-2026-08-23-construct-epoch-13-r1.md`; farm
-  `mde-theme` `22/22`). S4 notes: `docs/releases/magic-mesh-v13.0.0.md`.
-  Evidence: `WL-REL-001-2026-08-31-docs-delta-reconfirm-r1.md`. Do not
-  declare freeze until dest-operator leftover closes.
+  2026-08-23 matrix. Brand epoch `13` maps to Construct. Drain-branch
+  docs after dest-cut are not the freeze tree. `github-required` is
+  required on `master`; freeze-SHA CI
+  `https://github.com/matthewmackes/magic-mesh/actions/runs/33381446101`
+  is dispatched, not yet pass. Evidence:
+  `WL-REL-001-2026-08-31-source-freeze-r1.md`. Do not tag or publish
+  until `WL-REL-005`. Superseded 1dfe6906 must not receive new inputs.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded. Live FUNC-023 enroll
-     leftover is WL-TEST-003 after a testing Beta: 2872293b1 / 1787447942 is
-     the input-generation candidate (`WL-REL-001-2026-08-22-input-candidate-r1.md`).
-     Operator 2026-08-22 marked PR #71 Ready and authorized this record. Final
-     freeze still waits on REL-006 admission and reconfirmation, not live-seat
-     leftover. Superseded 1dfe6906 must not receive new inputs.
+     leftover is WL-TEST-003 after a testing Beta: dest-cut
+     `42035dcbd` / `1788153988` is now the frozen source on `master`.
+     `github-required` is required on `master` and has not yet passed.
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
@@ -494,17 +491,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: Operator 2026-08-30 authorized already-selected dests.
-  Maps dest is BigBoy `buffalo-niagara.mbtiles` `6d01a543…`. Catalog is
-  Flathub LibreOffice. RPM / App catalog / App VM receipts rebound to
-  `54ee58acf`. Selected bootc dest `3a5e74e6…` is gone from quay/farm;
-  produce now refuses tag-only pins. Maps offline-catalog dest exists
-  from dest MBTiles tiles and the rust verifier dest admits that
-  bundle. S7 argv and `release-input-preflight` passed at `42035dcbd`.
-  Later drain HEAD is docs-only; do not rebind dests for that delta.
-  Not freeze. Evidence:
-  `WL-REL-007-2026-08-31-s7-preflight-42035dcbd-r1.md` and
-  `WL-REL-001-2026-08-31-docs-delta-reconfirm-r1.md`.
+- Current state: Operator 2026-08-31 authorized dest-cut freeze.
+  Frozen source `42035dcbd` is on `master`. Maps dest `6d01a543…`
+  operator-admitted. Catalog is Flathub LibreOffice. RPM identity
+  inspect matched `06B1C27EA0…` at dest-cut. Selected bootc dest
+  `3a5e74e6…` is privately pinned for Surface; in-tree stack stays
+  blocked. S7 preflight passed at dest-cut. Do not rebind dests off
+  the freeze SHA. Evidence:
+  `WL-REL-001-2026-08-31-source-freeze-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
