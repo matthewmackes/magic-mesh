@@ -13,6 +13,9 @@ starts at the first packaged release line.
 
 ## [Unreleased]
 
+Production `13.0.0` notes: `docs/releases/magic-mesh-v13.0.0.md`. Planned tag:
+`magic-mesh-v13.0.0`. That file is not the final freeze.
+
 _Accumulating since the `magic-mesh-v12.0.0` tag (2026-07-02) toward the next
 operator-gated cut — a broad, still-open 12.0.x wave that fills out the Construct
 desktop. It spans a full **native application suite** (terminal, editor, media

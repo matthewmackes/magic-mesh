@@ -245,14 +245,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   `magic-mesh-v13.0.0` from one exact clean protected-default-branch revision,
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
-  Operator 2026-08-30 authorized dest-operator admission of already-selected
-  dests. Maps dest and dest-derived offline catalog are on BigBoy; the
-  rust verifier dest admits that bundle. RPM / App catalog / App VM
-  receipts rebound to `54ee58acf`. Selected bootc dest `3a5e74e6…` is
-  gone from quay/farm. S7 argv and `release-input-preflight` passed at
-  `73828796f`. Not freeze. Evidence:
-  `WL-REL-007-2026-08-31-s7-preflight-r1.md`. Exact
-  acceptance is Dell, Seat 15, Surface, and three lighthouses.
+  Operator 2026-08-31 authorized dest-cut freeze. Protected `master` is
+  `42035dcbd` / `1788153988`. S7 preflight passed at that SHA. Maps dest
+  operator-admitted. Surface dest pin is private selected `3a5e74e6…`;
+  in-tree stack stays blocked. `github-required` is required on `master`;
+  freeze-SHA CI is dispatched, not yet pass. Drain docs after dest-cut
+  are not the freeze tree. Evidence:
+  `WL-REL-001-2026-08-31-source-freeze-r1.md`. Exact acceptance is Dell,
+  Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
      Complete: `automation/promotion/release-intent.py` validates
@@ -395,25 +395,23 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Required outcome: freeze one clean, pushed, feature-complete `13.0.0` commit
   on the protected default branch and bind every release input, version surface,
   note, and tag plan to it.
-- Current state: dest-cut SHA is 7e3474eeb16cb8c4b8c9a378bfcd1f9c45f5e4ac
-  epoch 1787450205 (maps-verifier lock refresh after 2872293b1 `--locked`
-  refuse). Unpublished signed dest is bound; this is not the final freeze.
-  Superseded 1dfe6906 must not receive new inputs. S2 13.0.0 metadata remains
-  `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
-  2026-08-23 matrix (`WL-REL-001-2026-08-23-version-matrix-r1.md`;
-  `check-release-version-surfaces.sh` PASS). Brand epoch `13` maps to
-  Construct (`WL-REL-001-2026-08-23-construct-epoch-13-r1.md`; farm
-  `mde-theme` `22/22`). Live FUNC-023 enroll leftover is `WL-TEST-003`
-  after a testing Beta. Final S1/S4 freeze still needs REL-006 admission
-  and dest-cut SHA reconfirmation. Do not declare the final freeze until
-  that dest-operator leftover closes.
+- Current state: frozen source is 42035dcbd76b03b8323399892052b21a96e2e233
+  epoch 1788153988 on protected `master`. S7 preflight passed; S4 notes
+  name that revision. S2 13.0.0 metadata remains the 2026-08-16 farm
+  matrix. Drain-branch docs after dest-cut are not the freeze tree.
+  GitHub Actions was disabled (queued freeze dispatches had zero jobs).
+  Dest-operator enablement plus runner `mcnf-farm` started freeze-SHA CI
+  `https://github.com/matthewmackes/magic-mesh/actions/runs/33398044275`
+  (`in_progress`, not yet pass). Evidence:
+  `WL-REL-001-2026-08-31-github-required-unblocked-r1.md`. Do not tag or
+  publish until `WL-REL-005`. Superseded 1dfe6906 must not receive new
+  inputs.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded. Live FUNC-023 enroll
-     leftover is WL-TEST-003 after a testing Beta: 2872293b1 / 1787447942 is
-     the input-generation candidate (`WL-REL-001-2026-08-22-input-candidate-r1.md`).
-     Operator 2026-08-22 marked PR #71 Ready and authorized this record. Final
-     freeze still waits on REL-006 admission and reconfirmation, not live-seat
-     leftover. Superseded 1dfe6906 must not receive new inputs.
+     leftover is WL-TEST-003 after a testing Beta: dest-cut
+     `42035dcbd` / `1788153988` is now the frozen source on `master`.
+     `github-required` is required on `master` and has not yet passed
+     (run `33398044275` is in progress after Actions enablement).
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
@@ -494,15 +492,14 @@ is a capacity incident (§10.0.3), not a silent retry.
   be reconfirmed unchanged as the final frozen source, and produce the exact
   non-secret receipts required by the canonical preflight. Fixtures may
   exercise contracts but cannot satisfy a production gate.
-- Current state: Operator 2026-08-30 authorized already-selected dests.
-  Maps dest is BigBoy `buffalo-niagara.mbtiles` `6d01a543…`. Catalog is
-  Flathub LibreOffice. RPM / App catalog / App VM receipts rebound to
-  `54ee58acf`. Selected bootc dest `3a5e74e6…` is gone from quay/farm;
-  produce now refuses tag-only pins. Maps offline-catalog dest exists
-  from dest MBTiles tiles and the rust verifier dest admits that
-  bundle. S7 argv and `release-input-preflight` passed at `73828796f`.
-  Not freeze. Evidence:
-  `WL-REL-007-2026-08-31-s7-preflight-r1.md`.
+- Current state: Operator 2026-08-31 authorized dest-cut freeze.
+  Frozen source `42035dcbd` is on `master`. Maps dest `6d01a543…`
+  operator-admitted. Catalog is Flathub LibreOffice. RPM identity
+  inspect matched `06B1C27EA0…` at dest-cut. Selected bootc dest
+  `3a5e74e6…` is privately pinned for Surface; in-tree stack stays
+  blocked. S7 preflight passed at dest-cut. Do not rebind dests off
+  the freeze SHA. Evidence:
+  `WL-REL-001-2026-08-31-source-freeze-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -620,8 +617,7 @@ is a capacity incident (§10.0.3), not a silent retry.
        dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
        argv object exists. Operator 2026-08-30 authorized filling from
        already-selected dests. S7 argv and `release-input-preflight`
-       passed at `73828796f` (BigBoy dest paths). Not freeze. Do not
-       invent dests.
+       passed at `42035dcbd`. Not freeze. Do not invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
@@ -655,14 +651,16 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
 - Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable private production-candidate handoff.
-- Current state: unpublished signed 13.0.0 dest is bound
-  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`). Native F44 builder
-  `172.20.0.131` is up (toolchain-ready;
-  `WL-REL-002-2026-08-22-f44-builder-recover-r1.md`). BigBoy F42 `.130` is
-  halted for that RAM handoff. Official prepare still needs Maps/catalog
-  `REPLACE_*`. Not freeze. Operator 2026-08-23 authorized Remaining; live
-  FUNC-023 enroll leftover is WL-TEST-003 after a testing Beta. Official
-  cut still needs REL-006 admission.
+- Current state: freeze-SHA unsigned handoff exists on BigBoy
+  (`/home/mm/mcnf-unsigned-handoff-42035dcbd`, promotion forbidden;
+  `WL-REL-002-2026-08-31-unsigned-handoff-42035dcbd-r1.md`). Official
+  `run-first-full-release.sh prepare` PASS at dest-cut `42035dcbd` /
+  `1788153988` via container-F44 on `.130`. Native F44 builder
+  `172.20.0.131` is still down; container-F44 is compatibility evidence,
+  not the native production leftover. Historical unpublished dest
+  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`) is not this freeze
+  handoff. Live FUNC-023 enroll leftover remains WL-TEST-003 after a
+  testing Beta.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
@@ -710,15 +708,12 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and three verified image roles; no current-revision six-role set exists.
 - Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, and bootc roles.
-- Current state: a private, promotion-forbidden historical seven-role preview
-  exists for `afc24782ca9dc8e2e87f5676e403428a82285da1`, including now-deferred
-  Cuttlefish bytes. It cannot define the final six-role set and remains
-  non-promotable. WL-REL-001 also remains blocked
-  on the feature-complete source freeze; durable evidence is recorded in
-  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`. Self-signing
-  authorization is recorded. Do not ask for another signing-policy decision;
-  load the matching private key from a named system credential into an
-  ephemeral mode-0700 keyring and fail the signing gate if verification fails.
+- Current state: freeze-SHA S1–S3 signed RPMs and candidate manifests exist
+  on BigBoy; S5 dest-cut bootc receipt inspect PASS. Browser VM base
+  receipt recovered from Fedora registry at dest-cut digest `3a5e74e6…`
+  (`WL-REL-003-2026-08-31-browser-base-receipt-42035dcbd-r1.md`); did not
+  follow moved quay `:44`. App VM base inspect PASS. S4 derivatives and
+  S6 remain. Do not generate a second production RPM GPG key.
 - Remaining work:
   1. S1 Materialize and verify the self-signing boundary.
      - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
