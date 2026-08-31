@@ -650,14 +650,16 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: the release needs same-revision Workstation, Server, and Lighthouse RPMs; the loose artifact store has no admissible complete set.
 - Required outcome: build exactly three Fedora 44 RPM roles from the WL-REL-001 source and publish one immutable private production-candidate handoff.
-- Current state: unpublished signed 13.0.0 dest is bound
-  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`). Native F44 builder
-  `172.20.0.131` is up (toolchain-ready;
-  `WL-REL-002-2026-08-22-f44-builder-recover-r1.md`). BigBoy F42 `.130` is
-  halted for that RAM handoff. Official prepare still needs Maps/catalog
-  `REPLACE_*`. Not freeze. Operator 2026-08-23 authorized Remaining; live
-  FUNC-023 enroll leftover is WL-TEST-003 after a testing Beta. Official
-  cut still needs REL-006 admission.
+- Current state: freeze-SHA unsigned handoff exists on BigBoy
+  (`/home/mm/mcnf-unsigned-handoff-42035dcbd`, promotion forbidden;
+  `WL-REL-002-2026-08-31-unsigned-handoff-42035dcbd-r1.md`). Official
+  `run-first-full-release.sh prepare` PASS at dest-cut `42035dcbd` /
+  `1788153988` via container-F44 on `.130`. Native F44 builder
+  `172.20.0.131` is still down; container-F44 is compatibility evidence,
+  not the native production leftover. Historical unpublished dest
+  (`WL-REL-002-2026-08-22-unpublished-cut-sign-r1.md`) is not this freeze
+  handoff. Live FUNC-023 enroll leftover remains WL-TEST-003 after a
+  testing Beta.
 - Remaining work:
   1. S1 Reconfirm the frozen source immediately before build.
      - Inputs: WL-REL-001 source receipt, epoch, preflight argv, clean checkout, and farm topology.
@@ -705,15 +707,17 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and three verified image roles; no current-revision six-role set exists.
 - Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, and bootc roles.
-- Current state: a private, promotion-forbidden historical seven-role preview
-  exists for `afc24782ca9dc8e2e87f5676e403428a82285da1`, including now-deferred
-  Cuttlefish bytes. It cannot define the final six-role set and remains
-  non-promotable. WL-REL-001 also remains blocked
-  on the feature-complete source freeze; durable evidence is recorded in
-  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`. Self-signing
-  authorization is recorded. Do not ask for another signing-policy decision;
-  load the matching private key from a named system credential into an
-  ephemeral mode-0700 keyring and fail the signing gate if verification fails.
+- Current state: freeze-SHA S1–S2 self-sign is done on BigBoy
+  (`/home/mm/mcnf-signed-rpms-42035dcbd`;
+  `WL-REL-003-2026-08-31-prepare-rpms-42035dcbd-r1.md`). Governed
+  fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C` signed all three
+  roles in one invocation; payload digests match the unsigned freeze
+  handoff. S3–S6 (manifests, Browser/App VM derivatives, six-role plan)
+  remain. Historical seven-role preview `afc24782c`
+  (`WL-REL-003-WL-REL-004-preview-afc-r1.md`) cannot define the final set.
+  Do not generate a second production RPM GPG key. Load the matching
+  private key into an ephemeral mode-0700 keyring and fail if verification
+  fails.
 - Remaining work:
   1. S1 Materialize and verify the self-signing boundary.
      - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
