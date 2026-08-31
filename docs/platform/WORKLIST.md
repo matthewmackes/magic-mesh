@@ -246,12 +246,12 @@ is a capacity incident (§10.0.3), not a silent retry.
   with exactly six canonical roles and no fabricated or substituted evidence.
 - Current state: `WL-FUNC-023` archived 2026-08-30. S1–S2 and S4 landed.
   Operator 2026-08-30 authorized dest-operator admission of already-selected
-  dests. Maps mbtiles dest is on BigBoy; maps source-root dest is restored
-  on BigBoy `/home/mm/mcnf-maps-sources`. RPM identity receipt is bound to
-  `ba1726ffa` / `1788132281` at `/root/mcnf-private/rpm-signing-identity.json`
-  (secret lives on BigBoy, not this host). Surface `bootc_base` stays null.
+  dests. Maps mbtiles dest is on BigBoy; maps source-root dest is restored.
+  RPM / App catalog / App VM receipts were rebound to `54ee58acf` /
+  `1788132485`. Selected bootc dest `3a5e74e6…` is gone from quay; the
+  moved `:44` digest was not adopted. Surface `bootc_base` stays null.
   S7 argv was not written. Evidence:
-  `WL-REL-007-2026-08-30-maps-source-rpm-r1.md`. Exact
+  `WL-REL-007-2026-08-30-receipt-rebind-r1.md`. Exact
   acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -498,12 +498,13 @@ is a capacity incident (§10.0.3), not a silent retry.
   Maps dest remains BigBoy `/var/lib/mde/maps/buffalo-niagara/buffalo-niagara.mbtiles`
   sha256 `6d01a543c7a58f323656ce142a0e335e32a3070ecf03f7a9d655138df93f5895`.
   Catalog dest is Flathub LibreOffice. Bootc/App VM receipts exist under
-  `/root/mcnf-private/`. Maps source-root `/home/mm/mcnf-maps-sources` is
-  restored on BigBoy (TIGER sha matches 2026-08-22; Geofabrik latest
-  moved). RPM identity receipt is bound to `ba1726ffa` /
-  `1788132281`. Surface `bootc_base` stays null on the blocked stack. S7
-  argv was not written (cross-revision App/bootc receipts + `REPLACE_*`).
-  Evidence: `WL-REL-007-2026-08-30-maps-source-rpm-r1.md`.
+  `/root/mcnf-private/`. Maps source-root is restored. RPM / App catalog /
+  App VM receipts are rebound to `54ee58acf`. Selected bootc dest
+  `3a5e74e6…` is no longer on quay; the moved `:44` digest was not
+  adopted. Maps dest approval is still the `ab4a9d554` MBTiles sidecar,
+  not an offline-catalog tile approval. Surface `bootc_base` stays null.
+  S7 argv was not written. Evidence:
+  `WL-REL-007-2026-08-30-receipt-rebind-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -620,10 +621,11 @@ is a capacity incident (§10.0.3), not a silent retry.
        before any build mutation. Bootc `all-roles` receipt is now a private
        dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
        argv object exists. Operator 2026-08-30 authorized filling from
-       already-selected dests. Maps source-root dest is restored and the
-       RPM identity receipt is bound to `ba1726ffa`. S7 argv was not
-       written: App/bootc receipts are still cross-revision and Surface
-       `bootc_base` stays null. Do not invent dests.
+       already-selected dests. Maps source-root dest is restored. RPM /
+       App catalog / App VM receipts are rebound to `54ee58acf`. S7 argv
+       was not written: selected bootc dest `3a5e74e6…` is gone from
+       quay, Maps still lacks an offline-catalog tile approval, and
+       Surface `bootc_base` stays null. Do not invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
