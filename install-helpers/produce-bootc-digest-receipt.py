@@ -270,10 +270,36 @@ def main() -> int:
     inspect_parser.add_argument("--expected-source-revision", required=True)
     inspect_parser.add_argument("--expected-commit-epoch", required=True)
     inspect_parser.add_argument("--expected-release-role", required=True)
+    rebind = sub.add_parser("rebind")
+    rebind.add_argument("--receipt", required=True, type=Path)
+    rebind.add_argument("--source-revision", required=True)
+    rebind.add_argument("--commit-epoch", required=True)
+    rebind.add_argument("--output", required=True, type=Path)
     args = parser.parse_args()
     try:
         if args.command == "produce":
             value = document(args.repo, args.skopeo, args.image_reference, args.architecture, args.source_revision, args.commit_epoch, args.release_role)
+            body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
+            atomic_write(args.output, body)
+        elif args.command == "rebind":
+            current = parse_json(read_regular(args.receipt), "bootc digest receipt")
+            stored = current.get("image_reference")
+            digest = current.get("resolved_digest")
+            if not isinstance(stored, str) or not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest):
+                raise Refusal("bootc dest receipt identity is malformed")
+            inspect_receipt(
+                args.repo,
+                args.receipt,
+                f"{image_repository(stored)}@{digest}",
+                str(current.get("architecture")),
+                str(current.get("source_revision")),
+                str(current.get("commit_epoch")),
+                str(current.get("release_role")),
+            )
+            revision, commit_epoch = validate_release(args.repo, args.source_revision, args.commit_epoch)
+            value = dict(current)
+            value["source_revision"] = revision
+            value["commit_epoch"] = commit_epoch
             body = json.dumps(value, sort_keys=True, separators=(",", ":")).encode("ascii") + b"\n"
             atomic_write(args.output, body)
         else:

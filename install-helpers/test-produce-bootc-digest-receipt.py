@@ -94,6 +94,20 @@ def main() -> None:
         other_repo[other_repo.index("--expected-image-reference") + 1] = f"registry.invalid/other/bootc@{pin}"
         refused_repo = call(*base, *other_repo, ok=False)
         assert "repository" in refused_repo.stderr
+        (repo / "later").write_text("later\n")
+        subprocess.run(["git", "-C", str(repo), "add", "later"], check=True)
+        later_env = os.environ | {"GIT_AUTHOR_DATE": "1700000001 +0000", "GIT_COMMITTER_DATE": "1700000001 +0000"}
+        subprocess.run(["git", "-C", str(repo), "commit", "-qm", "later"], check=True, env=later_env)
+        later = subprocess.check_output(["git", "-C", str(repo), "rev-parse", "HEAD"], text=True).strip()
+        rebound = root / "rebound.json"
+        call(*base, "rebind", "--receipt", str(dest_path), "--source-revision", later, "--commit-epoch", "1700000001", "--output", str(rebound))
+        rebound_inspect = list(dest_inspect)
+        rebound_inspect[2] = str(rebound)
+        rebound_inspect[rebound_inspect.index("--expected-source-revision") + 1] = later
+        rebound_inspect[rebound_inspect.index("--expected-commit-epoch") + 1] = "1700000001"
+        call(*base, *rebound_inspect)
+        assert json.loads(rebound.read_text())["resolved_digest"] == pin
+        call(*base, "rebind", "--receipt", str(dest_path), "--source-revision", later, "--commit-epoch", "1700000001", "--output", str(rebound), ok=False)
     print("bootc digest receipt hostile self-test: PASS")
 
 if __name__ == "__main__": main()

@@ -249,9 +249,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   dests. Maps dest and dest-derived offline catalog are on BigBoy; the
   rust verifier dest admits that bundle. RPM / App catalog / App VM
   receipts rebound to `54ee58acf`. Selected bootc dest `3a5e74e6…` is
-  gone from quay/farm. Inspect now admits that dest receipt against a
-  digest pin. S7 argv was not written: dests are still cross-revision.
-  Evidence: `WL-REL-007-2026-08-31-bootc-dest-inspect-r1.md`. Exact
+  gone from quay/farm. S7 argv and `release-input-preflight` passed at
+  `73828796f`. Not freeze. Evidence:
+  `WL-REL-007-2026-08-31-s7-preflight-r1.md`. Exact
   acceptance is Dell, Seat 15, Surface, and three lighthouses.
 - Remaining work:
   1. S1 Establish SOL Luna execution ownership and release ordering.
@@ -500,9 +500,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   `54ee58acf`. Selected bootc dest `3a5e74e6…` is gone from quay/farm;
   produce now refuses tag-only pins. Maps offline-catalog dest exists
   from dest MBTiles tiles and the rust verifier dest admits that
-  bundle. Inspect now admits the selected bootc dest receipt against a
-  digest pin. S7 argv was not written: dests are still cross-revision.
-  Evidence: `WL-REL-007-2026-08-31-bootc-dest-inspect-r1.md`.
+  bundle. S7 argv and `release-input-preflight` passed at `73828796f`.
+  Not freeze. Evidence:
+  `WL-REL-007-2026-08-31-s7-preflight-r1.md`.
 - Remaining work:
   1. S1 Establish the open-source input policy.
      - Inputs: candidate source receipt, Fedora target, architecture, applicable
@@ -619,12 +619,9 @@ is a capacity incident (§10.0.3), not a silent retry.
        before any build mutation. Bootc `all-roles` receipt is now a private
        dest (`/root/mcnf-private/bootc-all-roles-digest.json`) and a bootc-bound
        argv object exists. Operator 2026-08-30 authorized filling from
-       already-selected dests. Maps source-root dest is restored. RPM /
-       App catalog / App VM receipts are rebound to `54ee58acf`. S7 argv
-       was not written: dests are still cross-revision (Maps
-       `f8dce4e0c`, RPM/App `54ee58acf`, bootc receipt `479ec2b8c`).
-       Inspect now admits the selected bootc dest against a digest pin.
-       Do not invent dests.
+       already-selected dests. S7 argv and `release-input-preflight`
+       passed at `73828796f` (BigBoy dest paths). Not freeze. Do not
+       invent dests.
      - Deliverable: private object path, derived driver-array path, redacted
        input inventory, and preflight transcript.
       - Validation: missing, changed, symlinked, stale, or cross-revision inputs
