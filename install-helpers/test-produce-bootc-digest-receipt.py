@@ -77,6 +77,23 @@ def main() -> None:
         mismatched = call(*base, *wrong, ok=False)
         assert "does not match" in mismatched.stderr
         assert not Path(wrong[-1]).exists()
+        dest = json.loads(receipt.read_text())
+        dest["image_reference"] = "registry.invalid/mcnf/bootc:release"
+        dest_path = root / "dest-tag.json"
+        dest_path.write_text(json.dumps(dest, sort_keys=True, separators=(",", ":")) + "\n")
+        dest_path.chmod(0o400)
+        dest_inspect = list(inspect)
+        dest_inspect[2] = str(dest_path)
+        dest_inspect[dest_inspect.index("--expected-image-reference") + 1] = f"registry.invalid/mcnf/bootc@{pin}"
+        call(*base, *dest_inspect)
+        other_pin = list(dest_inspect)
+        other_pin[other_pin.index("--expected-image-reference") + 1] = "registry.invalid/mcnf/bootc@sha256:" + "c" * 64
+        refused_pin = call(*base, *other_pin, ok=False)
+        assert "pin" in refused_pin.stderr
+        other_repo = list(dest_inspect)
+        other_repo[other_repo.index("--expected-image-reference") + 1] = f"registry.invalid/other/bootc@{pin}"
+        refused_repo = call(*base, *other_repo, ok=False)
+        assert "repository" in refused_repo.stderr
     print("bootc digest receipt hostile self-test: PASS")
 
 if __name__ == "__main__": main()

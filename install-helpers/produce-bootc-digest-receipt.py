@@ -171,6 +171,15 @@ def read_regular(path: Path) -> bytes:
 EXPECTED_KEYS = {"schema_version", "kind", "image_reference", "resolved_digest", "manifest_media_type", "os", "architecture", "source_revision", "commit_epoch", "release_role"}
 
 
+def image_repository(reference: str) -> str:
+    if "@" in reference:
+        reference = reference.rsplit("@", 1)[0]
+    last = reference.rsplit("/", 1)[-1]
+    if ":" in last:
+        return reference[: reference.rfind(":")]
+    return reference
+
+
 def inspect_receipt(repo: Path, path: Path, reference: str, architecture: str, revision: str, epoch: str, role: str) -> dict[str, object]:
     validate_identity(reference, architecture, role)
     revision, commit_epoch = validate_release(repo, revision, epoch)
@@ -181,14 +190,28 @@ def inspect_receipt(repo: Path, path: Path, reference: str, architecture: str, r
         raise Refusal("bootc digest receipt is non-canonical or has an unexpected schema")
     if value.get("schema_version") != 1 or value.get("kind") != "mcnf-bootc-image-digest":
         raise Refusal("bootc digest receipt kind or version is unsupported")
-    expected = {"image_reference": reference, "os": "linux", "architecture": architecture, "source_revision": revision, "commit_epoch": commit_epoch, "release_role": role}
-    if any(value.get(key) != item for key, item in expected.items()):
-        raise Refusal("bootc digest receipt does not match the requested release identity")
     digest = value.get("resolved_digest")
     if not isinstance(digest, str) or not DIGEST_RE.fullmatch(digest) or digest.endswith("0" * 64):
         raise Refusal("bootc digest receipt contains an invalid immutable digest")
     if value.get("manifest_media_type") not in LIST_MEDIA_TYPES | MANIFEST_MEDIA_TYPES:
         raise Refusal("bootc digest receipt contains an unsupported media type")
+    expected = {
+        "os": "linux",
+        "architecture": architecture,
+        "source_revision": revision,
+        "commit_epoch": commit_epoch,
+        "release_role": role,
+    }
+    if any(value.get(key) != item for key, item in expected.items()):
+        raise Refusal("bootc digest receipt does not match the requested release identity")
+    stored = value.get("image_reference")
+    if stored == reference:
+        return value
+    pinned = reference.rsplit("@", 1)[1]
+    if digest != pinned:
+        raise Refusal("bootc digest receipt does not match the requested pin")
+    if not isinstance(stored, str) or image_repository(stored) != image_repository(reference):
+        raise Refusal("bootc digest receipt does not name the requested image repository")
     return value
 
 
