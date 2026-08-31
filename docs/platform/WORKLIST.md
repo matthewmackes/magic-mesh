@@ -401,9 +401,9 @@ is a capacity incident (§10.0.3), not a silent retry.
   `check-release-version-surfaces.sh` PASS). Brand epoch `13` maps to
   Construct (`WL-REL-001-2026-08-23-construct-epoch-13-r1.md`; farm
   `mde-theme` `22/22`). Live FUNC-023 enroll leftover is `WL-TEST-003`
-  after a testing Beta. Final S1/S4 freeze still needs REL-006 admission
-  and dest-cut SHA reconfirmation. Do not declare the final freeze until
-  that dest-operator leftover closes.
+  after a testing Beta. S4 notes draft is
+  `docs/releases/magic-mesh-v13.0.0.md`. Final freeze still needs dest-cut
+  SHA reconfirmation. Do not declare freeze until that leftover closes.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded. Live FUNC-023 enroll
      leftover is WL-TEST-003 after a testing Beta: 2872293b1 / 1787447942 is
