@@ -400,17 +400,20 @@ is a capacity incident (§10.0.3), not a silent retry.
   SHA. S4 notes name that revision. S2 13.0.0 metadata remains
   `WL-REL-001-2026-08-16-version-metadata-farm-r1.md` plus the named
   2026-08-23 matrix. Brand epoch `13` maps to Construct. Drain-branch
-  docs after dest-cut are not the freeze tree. `github-required` is
-  required on `master`; freeze-SHA CI
-  `https://github.com/matthewmackes/magic-mesh/actions/runs/33381446101`
-  is dispatched, not yet pass. Evidence:
-  `WL-REL-001-2026-08-31-source-freeze-r1.md`. Do not tag or publish
-  until `WL-REL-005`. Superseded 1dfe6906 must not receive new inputs.
+  docs after dest-cut are not the freeze tree. GitHub Actions was
+  disabled (queued freeze dispatches had zero jobs). Dest-operator
+  enablement plus runner `mcnf-farm` started freeze-SHA CI
+  `https://github.com/matthewmackes/magic-mesh/actions/runs/33398044275`
+  (`in_progress`, not yet pass). Evidence:
+  `WL-REL-001-2026-08-31-github-required-unblocked-r1.md`. Do not tag or
+  publish until `WL-REL-005`. Superseded 1dfe6906 must not receive new
+  inputs.
 - Remaining work:
   1. S1 Select the immutable source. Candidate recorded. Live FUNC-023 enroll
      leftover is WL-TEST-003 after a testing Beta: dest-cut
      `42035dcbd` / `1788153988` is now the frozen source on `master`.
-     `github-required` is required on `master` and has not yet passed.
+     `github-required` is required on `master` and has not yet passed
+     (run `33398044275` is in progress after Actions enablement).
      - Inputs: pushed branch, root Cargo.toml, remote branch state, and archived implementation dispositions.
      - Action: fetch remote refs; require an empty worktree; record HEAD,
        upstream HEAD, commit epoch, Fedora target, and version as the input
