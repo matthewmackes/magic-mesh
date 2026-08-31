@@ -707,14 +707,13 @@ is a capacity incident (§10.0.3), not a silent retry.
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and three verified image roles; no current-revision six-role set exists.
 - Required outcome: self-sign the exact handoff RPMs without changing payload identity and produce Browser VM, App VM, and bootc roles.
-- Current state: freeze-SHA S1–S2 signed RPMs and S3 three-role candidate
-  manifests exist on BigBoy (`/home/mm/mcnf-signed-rpms-42035dcbd`,
-  `/home/mm/mcnf-s3-42035dcbd`;
-  `WL-REL-003-2026-08-31-s3-candidates-42035dcbd-r1.md`). App VM base
-  receipt inspect PASS at dest-cut. Browser VM base produce leftover:
-  dest-cut fedora-bootc digest is not live-pullable; do not follow moved
-  `:44`. S4–S6 remain. Historical seven-role preview `afc24782c` cannot
-  define the final set. Do not generate a second production RPM GPG key.
+- Current state: freeze-SHA S1–S3 signed RPMs and candidate manifests exist
+  on BigBoy; S5 dest-cut bootc receipt inspect PASS
+  (`WL-REL-003-2026-08-31-s5-bootc-inspect-42035dcbd-r1.md`). App VM base
+  receipt inspect PASS. Browser VM base produce leftover: dest-cut
+  fedora-bootc digest is not live-pullable; do not follow moved `:44`. S4
+  and S6 remain. Historical seven-role preview `afc24782c` cannot define
+  the final set. Do not generate a second production RPM GPG key.
 - Remaining work:
   1. S1 Materialize and verify the self-signing boundary.
      - Inputs: project release key, private signing material, RPM signing identity receipt, and WL-REL-002 handoff.
