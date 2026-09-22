@@ -532,12 +532,18 @@ Local heavy `cargo` remains blocked by
 - Current state: S1 collector PASS, six verified outputs, promotion
   forbidden. Manifest:
   `/home/mm/mcnf-private-s4/release-output-manifest-42035dcbd.json`.
-  Plan: `release-output-plan-42035dcbd-collect.json` from checkout
-  `42035dcbd`. Historical `afc24782` preview is not this bundle. Evidence:
-  `WL-REL-003-2026-09-22-s4-s6-42035dcbd-r6.md`.
+  BigBoy dom0 `172.20.145.165` has `.131` halted and `mcnf-build-52` at its
+  20 GiB static maximum on all 12 vCPUs; guest credit weight is 2048.
+  Signed RPM size gates passed on `.130` (workstation 89.6 MiB, server
+  55.4 MiB, lighthouse 14.9 MiB). Workstation payload gate passed. S2
+  matrix verify refuses: `release-gate-matrix.json` is still
+  `46ea21b6…`, not `42035dcbd`. Evidence:
+  `WL-REL-004-2026-09-22-bigboy-rpm-gates-r1.md`.
 - Remaining work:
   1. S1 Complete: six-role output collected on `.130`.
-  2. S2 Execute the canonical gate matrix for `42035dcbd`.
+  2. S2 Rebind and execute the gate matrix for `42035dcbd`. Failed gate:
+     `verify-release-gate-matrix.py --expected-revision 42035dcbd…` because
+     the in-tree matrix `source_revision` is `46ea21b6…`.
   3. S3 Generate aggregate six-role SBOM/license and evidence envelope.
   4. S4 Sign checksums and provenance with `sign-release.sh --evidence`.
   5. S5 Preflight remote publication without publishing.
