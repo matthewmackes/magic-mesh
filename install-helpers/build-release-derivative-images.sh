@@ -145,6 +145,25 @@ install -m 0400 -- "$app_disk" "$collection/app-vm-wayland-standard.qcow2"
 install -m 0400 -- "$browser_disk" "$collection/browser-vm-chromium.qcow2"
 install -m 0400 -- "$browser_manifest" "$collection/browser-vm-chromium.qcow2.mcnf-manifest.json"
 install -m 0400 -- "$frozen_profile" "$collection/browser-vm-chromium.profile.env"
+python3 - "$collection/browser-vm-chromium.qcow2.mcnf-manifest.json" \
+    browser-vm-chromium.qcow2 <<'PY'
+import json, os, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+filename = sys.argv[2]
+value = json.loads(path.read_text(encoding="utf-8"))
+artifact = value.get("artifact") if isinstance(value, dict) else None
+if not isinstance(artifact, dict) or not isinstance(artifact.get("filename"), str):
+    raise SystemExit(0)
+artifact["filename"] = filename
+body = (json.dumps(value, sort_keys=True, separators=(",", ":")) + "\n").encode()
+temporary = path.with_name(f".{path.name}.tmp")
+fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o400)
+with os.fdopen(fd, "wb") as stream:
+    stream.write(body)
+    stream.flush()
+    os.fsync(stream.fileno())
+os.replace(temporary, path)
+PY
 python3 "$BROWSER_MANIFEST_VERIFY" verify --repo-root "$ROOT" \
     --profile "$collection/browser-vm-chromium.profile.env" \
     --source-revision "$source_revision" \

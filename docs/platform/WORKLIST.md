@@ -162,8 +162,9 @@ Reference for future AI agents encountering similar issues.
 - **Root cause:** the helper published `browser-vm-chromium.mcnf-manifest.json`
   beside `browser-vm-chromium.qcow2`. The verifier requires
   `{image.name}.mcnf-manifest.json`.
-- **Solution:** publish `browser-vm-chromium.qcow2.mcnf-manifest.json` in
-  `install-helpers/build-release-derivative-images.sh`
+- **Solution:** publish `browser-vm-chromium.qcow2.mcnf-manifest.json` and
+  rewrite `artifact.filename` to `browser-vm-chromium.qcow2` before re-verify.
+  r5 passed the name check and refused the stale build filename.
 
 ## Service Release Queue
 
@@ -300,14 +301,13 @@ Local heavy `cargo` remains blocked by
   BigBoy. S5 dest-cut bootc receipt inspect PASS. Browser VM base receipt
   recovered from Fedora registry at dest-cut digest `3a5e74e6…`
   (`WL-REL-003-2026-08-31-browser-base-receipt-42035dcbd-r1.md`); did not
-  follow moved quay `:44`. r2 REFUSED: dest-cut Fedora base lacked `cpio`
-  (`WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`). r4 on `.130`
-  verified the App VM (`sha256:b733413e…`) and built the Browser VM qcow2,
-  then REFUSED: published sidecar was `browser-vm-chromium.mcnf-manifest.json`
-  but the verifier requires `browser-vm-chromium.qcow2.mcnf-manifest.json`.
-  Evidence: `WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r4.md`. Output
-  `/home/mm/mcnf-private-s4/derivatives-42035dcbd` was not published. Do not
-  start `.131`.
+  follow moved quay `:44`. r2 REFUSED: dest-cut Fedora base lacked `cpio`.
+  r4 REFUSED: published sidecar omitted `.qcow2`. r5 on `.130` built both
+  images and REFUSED because the copied manifest still named `disk.qcow2`
+  (`WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r5.md`). The publisher now
+  rewrites `artifact.filename` to the published image name before re-verify.
+  Output `/home/mm/mcnf-private-s4/derivatives-42035dcbd` was not published.
+  Do not start `.131`.
 - Remaining work:
   1. S1 Complete: governed fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C`
      selected; keyring destroyed after sign.
@@ -326,9 +326,9 @@ Local heavy `cargo` remains blocked by
      - Validation: image manifest verifiers, qcow2 checks, source revision
        checks, and hostile substitution fixture.
      - Done when: both derivatives verify and the helper publishes no partial
-       output. r2 lacked `cpio`. r4 built both images and refused the Browser
-       VM sidecar name; the publisher now uses
-       `{image.name}.mcnf-manifest.json`.
+       output. r2 lacked `cpio`. r4 used a short sidecar name. r5 kept the
+       build filename `disk.qcow2`; the publisher now rewrites it to the
+       published image name before re-verification.
   5. S5 Complete: bootc dest-cut receipt inspect PASS. Evidence:
      `WL-REL-003-2026-08-31-s5-bootc-inspect-42035dcbd-r1.md`.
   6. S6 Create the exact six-role plan input.
