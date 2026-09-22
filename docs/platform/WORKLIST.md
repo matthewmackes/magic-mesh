@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-09-22 critical-path finish of production 13.0.0
 
-- **9 active epics:** 4 `Remaining`, 4 `Blocked`, 1 `Awaiting testing`, 0 `Needs clarification`.
+- **9 active epics:** 2 `Remaining`, 6 `Blocked`, 1 `Awaiting testing`, 0 `Needs clarification`.
   Feature source is archived (`WL-FUNC-023` on 2026-08-30; `WL-FUNC-024` through
   `WL-FUNC-032` on 2026-08-29). This file is now the release-finish tracker, not a
   feature drain. Operator 2026-08-29 one-at-a-time source close still applies:
@@ -15,6 +15,10 @@ tasks.
   Operator 2026-08-31 authorized dest-cut freeze. Protected `master` is
   `42035dcbd` / `1788153988`. S7 preflight passed at that SHA. Do not invent a
   dest, mesh-id, or bearer. Do not flip `production_admitted`.
+- **No filler cargo (operator 2026-09-22):** do not run or dispatch `cargo
+  test`, `cargo build`, `cargo check`, or `cargo clippy` to occupy a slot.
+  A per-crate test whose epic is already satisfied is filler. `WL-REL-004`
+  S2–S5 is the release work and it is not a cargo grind.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Critical path (execute this, then flip the next Blocked epic to Remaining):**
   1. `WL-REL-003` S4/S6 complete. Collection
@@ -38,6 +42,8 @@ tasks.
     fail-closed; in-tree Surface stack stays blocked.
   - `WL-REL-002` — unsigned freeze handoff exists; native F44 `.131` is halted.
   - `WL-REL-005` — predecessor not green.
+  - `WL-REL-003` — S4/S6 complete. Do not re-run its crate test.
+  - `WL-TEST-002` — fixture cargo is filler until the operator reopens it.
   - `WL-TEST-003` — Awaiting a testing Beta. Dest-cut `bc14a22d7` and freeze-SHA
     seat installs are not that Beta.
 - **Single-authority lock:** typed Workload operations are the only VM/container
@@ -206,15 +212,13 @@ The canonical tick is `install-helpers/drain-coordinator.sh plan` or
 `automation/drain/ship-coordinator.sh --once`. Both read
 `install-helpers/farm-topology.sh` and `automation/lib/farm-jobs.sh active`.
 
-While Remaining epics exist, keep `min(active_farm_jobs, free_slots)` slots
-busy on those Remaining units only. After every commit/push, start
-`automation/reconciler/tick-fill.sh`. Do not wait for the 15-min timer. Do not
-hand-fan a cargo command the reconciler already owns. When cargo is fresh at
-the current clean HEAD, the next act is
-`automation/drain/leftover-units.sh runnable`. `WL-REL-003` S4/S6 is
+While Remaining epics exist, do not fill slots with filler cargo. The
+release path is `WL-REL-004` S2–S5. After every commit/push, start
+`automation/reconciler/tick-fill.sh` only when the active queue is not a
+cargo test or build grind. Do not hand-fan cargo. `WL-REL-003` S4/S6 is
 done. Live-seat leftovers live on `WL-TEST-003` and are not runnable.
-`WL-TEST-003` and are not runnable. `@leftover:{dest-operator}` /
-`keep` / `release-wait` do not fill slots and do not authorize invented dests.
+`@leftover:{dest-operator}` / `keep` / `release-wait` do not fill slots and
+do not authorize invented dests.
 
 Local heavy `cargo` remains blocked by
 `install-helpers/install-drain-guardrails.sh` (exit 97). Do not bypass.
@@ -292,7 +296,7 @@ Local heavy `cargo` remains blocked by
 
 ### WL-REL-003 - Self-sign RPMs and produce all derivative release roles
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P0
 - Complexity: Epic
 - Problem: a complete release requires three signed RPM roles and three verified
@@ -351,14 +355,14 @@ Local heavy `cargo` remains blocked by
 - Acceptance criteria: three RPM signatures verify without payload drift; three
   image roles verify; exactly six roles bind to `42035dcbd`.
 - Verification method: signing and role-specific verifiers, derivative hostile
-  suite, plan producer, and independent hash/identity comparison.
-  @farm:{cargo test -p mackesd}
+  suite, plan producer, and independent hash/identity comparison. S4/S6 are
+  complete. Do not dispatch a crate test for this epic.
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016,
   WL-FUNC-017, and WL-CRIT-006 release roles.
 
 ### WL-TEST-002 - Install and prove the newest complete release
 
-- Status: Remaining
+- Status: Blocked
 - Priority: P1
 - Complexity: Epic
 - Problem: farm fixture gates for the freeze-SHA candidate must stay green
@@ -373,13 +377,12 @@ Local heavy `cargo` remains blocked by
   Remaining; not six-role qualification. Live S1-S8 leftover moved to
   `WL-TEST-003`. Evidence:
   `WL-TEST-002-2026-08-31-native-f44-seat-install-42035dcbd-r1.md`.
-- Remaining work: farm fixture gates only. Do not fan live-seat, providers,
-  DRM capture, or guest install here.
-  1. Keep `cargo test -p mde-shell-egui` green at freeze SHA `42035dcbd`.
-  2. Record fixture regressions against this epic; reopen a named
-     implementation story if a fixture fails. Do not waive a missing fixture.
-  3. After `WL-REL-003` S6 exists, bind fixture identity to the six-role
-     candidate bytes; do not invent a second candidate.
+- Remaining work: parked. Do not run fixture cargo to fill a slot.
+  1. Do not dispatch the shell-egui crate test.
+  2. Record fixture regressions against this epic only if the operator
+     reopens it. Do not waive a missing fixture.
+  3. After a signed six-role bundle exists, bind fixture identity to those
+     bytes. Do not invent a second candidate.
 - Scope: farm fixture gates and unpublished-candidate identity checks only.
 - Relevant files/components: docs/platform/release-evidence, install-helpers
   release/live/recovery verifiers, packaging installed-identity tools, and
@@ -388,8 +391,8 @@ Local heavy `cargo` remains blocked by
 - Acceptance criteria: farm fixtures pass at the freeze SHA; live leftovers
   remain on `WL-TEST-003`; no fixture pass is treated as installed-seat proof.
 - Verification method: focused farm fixture gates. Live three-seat checks stay
-  on `WL-TEST-003`.
-  @farm:{cargo test -p mde-shell-egui}
+  on `WL-TEST-003`. Operator 2026-09-22: do not grind this crate test to fill
+  a slot.
 - Origin or merged source IDs: WL-TEST-001 proof boundary and deferred queues
   from archived UX, Music, Collaboration, guest, and recovery epics.
 
@@ -557,8 +560,8 @@ Local heavy `cargo` remains blocked by
 - Acceptance criteria: one signed immutable six-role evidence bundle passes
   all mandatory gates and rejects any artifact-set drift.
 - Verification method: farm gates, collector and gate verifiers, SBOM/evidence
-  checks, and publication preflight.
-  @farm:{cargo test -p mde-bus}
+  checks, and publication preflight. Do not substitute a crate test for S2–S5.
+  @farm:{cargo metadata --format-version 1}
 - Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006
   production-evidence responsibilities.
 
