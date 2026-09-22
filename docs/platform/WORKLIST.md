@@ -99,6 +99,64 @@ leaving parked lanes parked. Reuse a fresh HEAD farm result. Do not grind
 dest-operator, live-seat, or release-wait leftovers. After `WL-REL-003` S6
 passes, flip `WL-REL-004` to Remaining and continue the chain.
 
+## Solved Alerts and Blockers — 2026-09-22
+
+Reference for future AI agents encountering similar issues.
+
+### Farm host unreachable (BigBoy `.130` halted)
+- **Symptom:** `172.20.0.130` ssh timeout; `.90` RPM-initdb lock refused
+- **Root cause:** `mcnf-build-f44` (`.131`) was running and consuming BigBoy's
+  20 GiB RAM allocation; `.130` was halted
+- **Solution:** RAM handoff — halt `.131` via dom0 `xl shutdown mcnf-build-f44`,
+  then start `.130` via `xl create /etc/xen/mcnf-build-52.cfg`
+- **Prevention:** Do not start `.131` while S4 needs `.130`
+
+### RPM initdb lock refusal on admitted hosts
+- **Symptom:** `error: can't create transaction lock on /tmp/…/.rpm.lock`
+- **Root cause:** Fedora 42+ `rpm --initdb --dbpath` requires root or fails
+  with permission denied in unprivileged contexts
+- **Solution:** PATH wrapper at `/home/mm/bin/rpm` using Python
+  `rpm.TransactionSet.initDB()` which handles the lock correctly
+- **File:** Wrapper deployed on `.130` only; `.90` cannot admit S4 RPM work
+
+### App VM derivative missing cpio
+- **Symptom:** `FATAL: App VM RPM supply refused: cpio is required`
+- **Root cause:** Dest-cut Fedora base image does not ship `cpio`;
+  `verify-rpm-supply.sh` requires it for `rpm2cpio`
+- **Solution:** Add `cpio` to `packaging/app-vm/Containerfile`
+  `dnf -y install gnupg2 cpio`
+- **Contract:** `packaging/app-vm/verify-contract.sh` updated to require `cpio`
+
+### App VM F42/F44 base mismatch
+- **Symptom:** `dnf` dependency conflicts; `libavcodec.so.62` / `glibc_2.43` missing
+- **Root cause:** App VM base receipt (`quay.io/fedora/fedora@sha256:e78cd1a6…`)
+  was effectively Fedora 42; dest-cut Workstation RPM was built for Fedora 44
+- **Solution:** Use F44 bootc base for App VM:
+  `registry.fedoraproject.org/fedora-bootc@sha256:3a5e74e668761be9e16c6779950ae154d9dcbb0861d1e92140c0751fed1f5357`
+- **Receipt:** New private receipt `app-vm-base-digest-42035dcbd-bootc.json`
+
+### mackesd Android observation age test failure
+- **Symptom:** `cargo test -p mackesd` exit 101; assertion `Unavailable != Booting`
+- **Root cause:** Fixture used hardcoded `observed_at_unix_ms = 1_786_000_000_000`
+  (August 2026); now older than `MAX_ANDROID_OBSERVATION_AGE_MS` (30 days)
+- **Solution:** Changed fixture to wall-clock-relative observation timestamp
+- **Evidence:** `WL-REL-003-2026-09-22-mackesd-android-age-r1.md`
+
+### Yanked crates in cargo-deny
+- **Symptom:** `cargo deny check` fails on `chacha20` 0.10.1, `quick-xml` 0.30.0
+- **Root cause:** Upstream yanked both versions
+- **Solution:**
+  - `chacha20` 0.10.1 → 0.10.2 (via updated `rand` 0.10.2)
+  - `quick-xml` 0.30.0 patched off by vendoring `zbus_xml` 4.0.0 with `quick-xml` 0.41
+- **Note:** `chacha20` 0.9.1 (via `chacha20poly1305` 0.10.1) is not yanked
+
+### TLS/signing RUSTSEC advisories
+- **Symptom:** `cargo deny check` fails on cert/signing-adjacent crates
+- **Solution:** Drain-branch `Cargo.lock` patched:
+  - `rustls` 0.23.43 → 0.23.45 (RUSTSEC-2026-0285)
+  - `h2` 0.4.15 → 0.4.16 (RUSTSEC-2026-0258)
+  - `cryptoki` 0.12.0 → 0.12.1 (RUSTSEC-2026-0286)
+
 ## Service Release Queue
 
 1. Build Browser VM and App VM derivatives and the six-role plan (`WL-REL-003`).
@@ -234,12 +292,14 @@ Local heavy `cargo` remains blocked by
   BigBoy. S5 dest-cut bootc receipt inspect PASS. Browser VM base receipt
   recovered from Fedora registry at dest-cut digest `3a5e74e6…`
   (`WL-REL-003-2026-08-31-browser-base-receipt-42035dcbd-r1.md`); did not
-  follow moved quay `:44`. App VM base inspect PASS. 2026-09-22 S4 dest-cut
-  RPM admission on `.130` PASS (wrapper + workstation `9f78ec2b…` /
-  lighthouse `c4057d9c…` match S3). Helper then REFUSED inside the App VM
-  image: dest-cut Fedora base lacks `cpio` before `verify-rpm-supply.sh`.
-  Evidence: `WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`. Do not
-  start `.131`.
+  follow moved quay `:44`. 2026-09-22 r2 REFUSED because the dest-cut Fedora
+  base lacked `cpio` (`WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`).
+  r4 is in flight on `.130` slot 1 against the F44 bootc base
+  `sha256:3a5e74e6…` and the `cpio` Containerfile fix. App VM image verified
+  `sha256:b733413e1a0163c867d7a00c7fb3b92b2c5abc45c27cea331329a984abc4373c`.
+  Browser VM is in `bootc install to-filesystem`. Output
+  `/home/mm/mcnf-private-s4/derivatives-42035dcbd` stays absent until the
+  helper publishes both images. Do not start a second S4. Do not start `.131`.
 - Remaining work:
   1. S1 Complete: governed fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C`
      selected; keyring destroyed after sign.
