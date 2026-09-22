@@ -22,7 +22,7 @@ COPY packaging/repo/magic-mesh.repo /etc/yum.repos.d/magic-mesh.repo
 COPY packaging/repo/RPM-GPG-KEY-magic-mesh /tmp/RPM-GPG-KEY-magic-mesh
 
 RUN set -eux; \
-    dnf -y install gnupg2; \
+    dnf -y install gnupg2 cpio; \
     install -d -m 0700 /tmp/mcnf-gnupg; \
     export GNUPGHOME=/tmp/mcnf-gnupg; \
     printf '%s\n' "${MCNF_APP_VM_BASE_IMAGE_ID}" | grep -Eq '^sha256:[0-9a-fA-F]{64}$' || { \

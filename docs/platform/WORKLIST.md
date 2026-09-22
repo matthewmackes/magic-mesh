@@ -28,8 +28,10 @@ tasks.
 - **Parked (do not fan to fill slots):**
   - `WL-REL-001` — `github-required` failed. Drain-branch patched rustls
     0.23.45, h2 0.4.16, cryptoki 0.12.1. Remaining deny leftovers are
-    yanked `chacha20` 0.9.1 and `quick-xml` 0.30.0. Official RPM secret
-    inspect waits on unreachable XEN-BIGBOY / `.130`.
+    yanked `chacha20` 0.10.1 (now 0.10.2) and `quick-xml` 0.30.0 (patched
+    off `zbus_xml`). `chacha20` 0.9.1 remains and is not yanked. Official
+    RPM secret inspect PASS on `.130`
+    (`WL-REL-001-2026-09-22-rpm-secret-inspect-r1.md`).
   - `WL-REL-006` — dest-operator leftovers closed; `production_admitted` is
     fail-closed; in-tree Surface stack stays blocked.
   - `WL-REL-002` — unsigned freeze handoff exists; native F44 `.131` is halted
@@ -178,9 +180,9 @@ Local heavy `cargo` remains blocked by
   Surface dest pin is private selected `3a5e74e6…`; in-tree stack stays
   blocked. `github-required` failed. Unadmitted `ReleaseIntentV1` draft
   exists privately for `42035dcbd`; admission stays dest-operator.
-  Next owning work is `WL-REL-003` S4/S6 once `.130` returns with the
-  dest-cut signed RPM dir. Native-F44 local bytes do not match S3
-  manifests. Evidence: `WL-REL-001-2026-09-22-signing-and-tls-r1.md`.
+  Next owning work is `WL-REL-003` S4/S6: dest-cut RPMs admitted on `.130`;
+  App VM image lacked `cpio`. Native-F44 local bytes do not match S3
+  manifests. Evidence: `WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`.
 - Remaining work:
   1. S1 Complete except dest-operator admission: contracts refuse invented
      dests; private unadmitted draft exists at
@@ -232,11 +234,12 @@ Local heavy `cargo` remains blocked by
   BigBoy. S5 dest-cut bootc receipt inspect PASS. Browser VM base receipt
   recovered from Fedora registry at dest-cut digest `3a5e74e6…`
   (`WL-REL-003-2026-08-31-browser-base-receipt-42035dcbd-r1.md`); did not
-  follow moved quay `:44`. App VM base inspect PASS. 2026-09-22 S4 on `.90`:
-  hostile suite PASS; helper REFUSED (`rpm --initdb` lock, then native-F44
-  RPMs do not match S3 dest-cut `rpm_sha256`). Matching signed dir remains
-  `/home/mm/mcnf-signed-rpms-42035dcbd` on unreachable `.130`. Evidence:
-  `WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r1.md`. Do not start `.131`.
+  follow moved quay `:44`. App VM base inspect PASS. 2026-09-22 S4 dest-cut
+  RPM admission on `.130` PASS (wrapper + workstation `9f78ec2b…` /
+  lighthouse `c4057d9c…` match S3). Helper then REFUSED inside the App VM
+  image: dest-cut Fedora base lacks `cpio` before `verify-rpm-supply.sh`.
+  Evidence: `WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`. Do not
+  start `.131`.
 - Remaining work:
   1. S1 Complete: governed fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C`
      selected; keyring destroyed after sign.
@@ -255,8 +258,8 @@ Local heavy `cargo` remains blocked by
      - Validation: image manifest verifiers, qcow2 checks, source revision
        checks, and hostile substitution fixture.
      - Done when: both derivatives verify and the helper publishes no partial
-       output. Failed gate 2026-09-22: dest-cut signed RPM dir is only on
-       unreachable `.130`; do not substitute native-F44 or older cuts.
+       output. Failed gate 2026-09-22 r2: dest-cut App VM base image has no
+       `cpio`; Containerfile now installs it before RPM supply verify.
   5. S5 Complete: bootc dest-cut receipt inspect PASS. Evidence:
      `WL-REL-003-2026-08-31-s5-bootc-inspect-42035dcbd-r1.md`.
   6. S6 Create the exact six-role plan input.
@@ -421,9 +424,10 @@ Local heavy `cargo` remains blocked by
   exact upstream jobs: farm-gate policy, rustfmt `found.rs`, fedora-native
   and coverage (`mde-collab-core` blob root-open), cargo-deny licenses plus
   advisories. Drain-branch now has rustls 0.23.45, h2 0.4.16, cryptoki
-  0.12.1. Remaining deny leftovers: yanked `chacha20` 0.9.1 and
-  `quick-xml` 0.30.0. Evidence:
-  `WL-REL-001-2026-09-22-signing-and-tls-r1.md`.
+  0.12.1. Yanked `chacha20` 0.10.1 and `quick-xml` 0.30.0 dropped; `chacha20`
+  0.9.1 remains and is not yanked. Official RPM secret inspect PASS.
+  Evidence: `WL-REL-001-2026-09-22-signing-and-tls-r1.md`,
+  `WL-REL-001-2026-09-22-rpm-secret-inspect-r1.md`.
 - Remaining work: do not tag or publish. Do not generate new dests.
   1. S1 Candidate recorded as `42035dcbd` / `1788153988`. Final freeze
      disposition waits for `github-required` pass at that exact SHA.
@@ -438,9 +442,8 @@ Local heavy `cargo` remains blocked by
   docs/RELEASE-VERSIONING.md, install-helpers/source-revision-receipt.sh,
   install-helpers/release-input-preflight.sh.
 - Dependencies: blocked on required check `github-required` at `42035dcbd`.
-  Failed gate after drain-branch TLS/PKCS#11 lock refresh: yanked
-  `chacha20` 0.9.1 and `quick-xml` 0.30.0. Official RPM secret inspect
-  failed gate: XEN-BIGBOY `172.20.145.165` unreachable.
+  Drain-branch yanked leftovers closed; `lru` advisory via `ratatui` remains.
+  Official RPM secret inspect PASS on `.130`.
   Do not treat a job with that name that is not required as release authority.
 - Acceptance criteria: one clean pushed revision is frozen; all version
   surfaces and inputs bind to it; stale artifacts cannot enter later stages.
