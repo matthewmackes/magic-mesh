@@ -45,6 +45,13 @@ version = 2
 allow = [
     "GPL-3.0-or-later",
     "GPL-3.0-only",
+    # Vendored spice-client still ships the deprecated SPDX `GPL-3.0`.
+    "GPL-3.0",
+    # libmpv2 / libmpv2-sys (Music) ship deprecated `LGPL-2.1`.
+    "LGPL-2.1-only",
+    "LGPL-2.1",
+    # webpki-roots (rustls CA store) ships CDLA-Permissive-2.0.
+    "CDLA-Permissive-2.0",
     "MPL-2.0",
     "Unlicense",
     "MIT",

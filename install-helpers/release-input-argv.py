@@ -233,11 +233,13 @@ def canonical_argv(values: dict[str, str | list[str]]) -> list[str]:
 def driver_argv(values: dict[str, str | list[str]]) -> list[str]:
     """Return the prepare-driver argv derived from the validated object.
 
-    The driver owns source revision and epoch, so those three argv entries are
-    deliberately removed from the canonical preflight invocation.
+    The driver invokes the preflight binary and owns source revision and epoch,
+    so the canonical execv prefix (script path plus those two option pairs) is
+    removed. Remaining entries are dest flags only.
     """
     result = canonical_argv(values)
-    del result[1:5]
+    # canonical: [PREFLIGHT, --source-revision, REV, --source-epoch, EPOCH, ...]
+    del result[0:5]
     return result
 
 

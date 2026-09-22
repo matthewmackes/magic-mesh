@@ -57,7 +57,7 @@ printf 'browser-builder %s\n' "$*" >>"$CALLS"
 [ "${FAIL_BROWSER_BUILD:-0}" -eq 0 ] || exit 8
 while [ "$#" -gt 0 ]; do [ "$1" = --out ] && { out=$2; break; }; shift; done
 mkdir -p "$out/qcow2"; printf 'browser-disk\n' >"$out/qcow2/disk.qcow2"
-printf '{"verified":true}\n' >"$out/qcow2/disk.qcow2.mcnf-manifest.json"
+printf '{"artifact":{"filename":"disk.qcow2"},"verified":true}\n' >"$out/qcow2/disk.qcow2.mcnf-manifest.json"
 chmod 0400 "$out/qcow2/"*
 EOF
 cat >"$work/bin/manifest-verify" <<'EOF'
@@ -93,6 +93,10 @@ before=$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")
 run --output "$work/out-parent/good"
 [ -f "$work/out-parent/good/derivative-images.json" ]
 [ -f "$work/out-parent/good/app-vm-wayland-standard.mcnf-manifest.json" ]
+[ -f "$work/out-parent/good/browser-vm-chromium.qcow2.mcnf-manifest.json" ]
+[ ! -e "$work/out-parent/good/browser-vm-chromium.mcnf-manifest.json" ]
+grep -Fq '"filename":"browser-vm-chromium.qcow2"' \
+  "$work/out-parent/good/browser-vm-chromium.qcow2.mcnf-manifest.json"
 [ -f "$work/out-parent/good/browser-vm-chromium.profile.env" ]
 grep -Fxq "BROWSER_VM_SOURCE_COMMIT=$REVISION" \
   "$work/out-parent/good/browser-vm-chromium.profile.env"
@@ -114,6 +118,7 @@ grep -Fq "browser-builder --profile " "$work/calls"
 grep -Fq -- "--source-revision $REVISION" "$work/calls"
 grep -Fq "manifest-verify verify --repo-root $ROOT --profile " "$work/calls"
 grep -Fq -- "/collection/browser-vm-chromium.profile.env" "$work/calls"
+grep -Fq -- "/collection/browser-vm-chromium.qcow2.mcnf-manifest.json" "$work/calls"
 grep -Fq -- "--source-revision $REVISION" "$work/calls"
 [ "$before" = "$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")" ]
 

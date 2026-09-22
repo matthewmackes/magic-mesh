@@ -744,6 +744,25 @@ mod tests {
     use std::io::{Cursor, Read};
     use std::sync::{Arc, Barrier};
 
+    fn unix_effective_uid_is_root() -> bool {
+        #[cfg(unix)]
+        {
+            std::fs::read_to_string("/proc/self/status")
+                .ok()
+                .and_then(|status| {
+                    status.lines().find_map(|line| {
+                        let rest = line.strip_prefix("Uid:")?;
+                        rest.split_whitespace().next()?.parse::<u32>().ok()
+                    })
+                })
+                .is_some_and(|uid| uid == 0)
+        }
+        #[cfg(not(unix))]
+        {
+            false
+        }
+    }
+
     fn staging_files(root: &std::path::Path) -> Vec<std::path::PathBuf> {
         let mut found = Vec::new();
         let Ok(shards) = std::fs::read_dir(root) else {
@@ -1011,15 +1030,23 @@ mod tests {
         let _ = replay.retain();
 
         let canonical = store.path_for(&expected.sha256_hex).expect("path");
-        assert!(std::fs::metadata(&canonical)
-            .expect("canonical metadata")
-            .permissions()
-            .readonly());
+        let metadata = std::fs::metadata(&canonical).expect("canonical metadata");
+        assert!(metadata.permissions().readonly());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                metadata.permissions().mode() & 0o222,
+                0,
+                "canonical bytes must not be owner/group/other writable"
+            );
+        }
         let mutation = std::fs::OpenOptions::new().write(true).open(&canonical);
-        assert!(matches!(
-            mutation,
-            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied
-        ));
+        match mutation {
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {}
+            Ok(_) if unix_effective_uid_is_root() && metadata.permissions().readonly() => {}
+            other => panic!("canonical left writable for a non-root opener: {other:?}"),
+        }
         assert_eq!(store.get(&expected).expect("immutable bytes"), bytes);
     }
 

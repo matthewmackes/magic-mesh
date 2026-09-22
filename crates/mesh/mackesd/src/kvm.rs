@@ -157,7 +157,7 @@ impl PoolCmd {
 }
 
 /// Pure fold of the `node-virt.yml` default-pool recipe over an injectable
-/// `virsh` runner. Production wires [`ensure_default_storage_pool`].
+/// `virsh` runner. Production wires the runner from `workload_compute`.
 pub fn prepare_default_storage_pool<F>(mut run: F) -> Result<PoolPrepare, String>
 where
     F: FnMut(&[&str]) -> Result<PoolCmd, String>,
@@ -216,8 +216,12 @@ where
 }
 
 /// Create `/var/lib/libvirt/images` and apply [`prepare_default_storage_pool`]
-/// through live `virsh`. Best-effort: callers log and continue.
-pub fn ensure_default_storage_pool() -> Result<PoolPrepare, String> {
+/// through the caller's live `virsh` runner. The sole Workload adapter owns
+/// the spawn; this helper does not.
+pub fn ensure_default_storage_pool<F>(run: F) -> Result<PoolPrepare, String>
+where
+    F: FnMut(&[&str]) -> Result<PoolCmd, String>,
+{
     use std::os::unix::fs::PermissionsExt;
     let target = std::path::Path::new(DEFAULT_POOL_TARGET);
     std::fs::create_dir_all(target).map_err(|error| error.to_string())?;
@@ -226,17 +230,7 @@ pub fn ensure_default_storage_pool() -> Result<PoolPrepare, String> {
         .permissions();
     permissions.set_mode(0o711);
     std::fs::set_permissions(target, permissions).map_err(|error| error.to_string())?;
-    prepare_default_storage_pool(|args| {
-        let output = std::process::Command::new("virsh")
-            .args(args)
-            .output()
-            .map_err(|error| error.to_string())?;
-        Ok(PoolCmd {
-            success: output.status.success(),
-            stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
-            stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
-        })
-    })
+    prepare_default_storage_pool(run)
 }
 
 #[cfg(test)]

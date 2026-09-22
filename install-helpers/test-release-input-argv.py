@@ -113,7 +113,11 @@ def main() -> None:
         check(derived.stat().st_mode & 0o777 == 0o400, "derived arguments were not mode 0400")
         check("--source-revision" not in derived_args, "driver arguments duplicated source revision")
         check("--source-epoch" not in derived_args, "driver arguments duplicated source epoch")
-        check(derived_args[0].endswith("/release-input-preflight.sh"), "derived preflight path is wrong")
+        check(
+            not any(str(argument).endswith("/release-input-preflight.sh") for argument in derived_args),
+            "driver arguments must not include the preflight path",
+        )
+        check(derived_args[0] == "--maps-approval", "driver arguments must start with dest flags")
         check(emit(loader, good, derived).returncode == 2, "existing derived output was overwritten")
 
         permissive = publish("permissive.json", document, 0o600)

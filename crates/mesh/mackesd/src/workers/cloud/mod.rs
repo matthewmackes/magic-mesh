@@ -2696,7 +2696,10 @@ mod tests {
             .expect("valid inventory request");
         let mut inventory = AndroidAppInventory::pending("phone-a");
         inventory.guest_boot_state = AndroidGuestBootState::Booting;
-        inventory.observed_at_unix_ms = Some(1_786_000_000_000);
+        // Wall-clock relative: a fixed 2026-08 fixture ages out of
+        // MAX_ANDROID_OBSERVATION_AGE_MS and projects Unavailable.
+        let observed_at = u64::try_from(now_ms()).unwrap_or(2).max(2);
+        inventory.observed_at_unix_ms = Some(observed_at);
         inventory.observation_age_ms = Some(0);
         let response = AndroidGuestInventoryResponse::new(&request, inventory.clone())
             .expect("valid booting inventory response");
@@ -2712,11 +2715,11 @@ mod tests {
         );
         assert_eq!(
             state.android_inventories[0].observed_at_unix_ms,
-            Some(1_786_000_000_000)
+            Some(observed_at)
         );
 
         let mut older = inventory;
-        older.observed_at_unix_ms = Some(1_785_999_999_999);
+        older.observed_at_unix_ms = Some(observed_at.saturating_sub(1));
         let older_response = AndroidGuestInventoryResponse::new(&request, older)
             .expect("valid older inventory response");
         assert!(matches!(
@@ -2725,7 +2728,7 @@ mod tests {
         ));
         assert_eq!(
             worker.build_state().android_inventories[0].observed_at_unix_ms,
-            Some(1_786_000_000_000)
+            Some(observed_at)
         );
     }
 
