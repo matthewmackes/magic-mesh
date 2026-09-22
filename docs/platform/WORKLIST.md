@@ -157,6 +157,14 @@ Reference for future AI agents encountering similar issues.
   - `h2` 0.4.15 → 0.4.16 (RUSTSEC-2026-0258)
   - `cryptoki` 0.12.0 → 0.12.1 (RUSTSEC-2026-0286)
 
+### Browser VM published sidecar name
+- **Symptom:** `verify-browser-vm-image-manifest: manifest does not use the canonical image sidecar name`
+- **Root cause:** the helper published `browser-vm-chromium.mcnf-manifest.json`
+  beside `browser-vm-chromium.qcow2`. The verifier requires
+  `{image.name}.mcnf-manifest.json`.
+- **Solution:** publish `browser-vm-chromium.qcow2.mcnf-manifest.json` in
+  `install-helpers/build-release-derivative-images.sh`
+
 ## Service Release Queue
 
 1. Build Browser VM and App VM derivatives and the six-role plan (`WL-REL-003`).
@@ -292,14 +300,14 @@ Local heavy `cargo` remains blocked by
   BigBoy. S5 dest-cut bootc receipt inspect PASS. Browser VM base receipt
   recovered from Fedora registry at dest-cut digest `3a5e74e6…`
   (`WL-REL-003-2026-08-31-browser-base-receipt-42035dcbd-r1.md`); did not
-  follow moved quay `:44`. 2026-09-22 r2 REFUSED because the dest-cut Fedora
-  base lacked `cpio` (`WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`).
-  r4 is in flight on `.130` slot 1 against the F44 bootc base
-  `sha256:3a5e74e6…` and the `cpio` Containerfile fix. App VM image verified
-  `sha256:b733413e1a0163c867d7a00c7fb3b92b2c5abc45c27cea331329a984abc4373c`.
-  Browser VM is in `bootc install to-filesystem`. Output
-  `/home/mm/mcnf-private-s4/derivatives-42035dcbd` stays absent until the
-  helper publishes both images. Do not start a second S4. Do not start `.131`.
+  follow moved quay `:44`. r2 REFUSED: dest-cut Fedora base lacked `cpio`
+  (`WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r2.md`). r4 on `.130`
+  verified the App VM (`sha256:b733413e…`) and built the Browser VM qcow2,
+  then REFUSED: published sidecar was `browser-vm-chromium.mcnf-manifest.json`
+  but the verifier requires `browser-vm-chromium.qcow2.mcnf-manifest.json`.
+  Evidence: `WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r4.md`. Output
+  `/home/mm/mcnf-private-s4/derivatives-42035dcbd` was not published. Do not
+  start `.131`.
 - Remaining work:
   1. S1 Complete: governed fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C`
      selected; keyring destroyed after sign.
@@ -318,8 +326,9 @@ Local heavy `cargo` remains blocked by
      - Validation: image manifest verifiers, qcow2 checks, source revision
        checks, and hostile substitution fixture.
      - Done when: both derivatives verify and the helper publishes no partial
-       output. Failed gate 2026-09-22 r2: dest-cut App VM base image has no
-       `cpio`; Containerfile now installs it before RPM supply verify.
+       output. r2 lacked `cpio`. r4 built both images and refused the Browser
+       VM sidecar name; the publisher now uses
+       `{image.name}.mcnf-manifest.json`.
   5. S5 Complete: bootc dest-cut receipt inspect PASS. Evidence:
      `WL-REL-003-2026-08-31-s5-bootc-inspect-42035dcbd-r1.md`.
   6. S6 Create the exact six-role plan input.

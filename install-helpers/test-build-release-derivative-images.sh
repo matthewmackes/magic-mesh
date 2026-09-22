@@ -93,6 +93,8 @@ before=$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")
 run --output "$work/out-parent/good"
 [ -f "$work/out-parent/good/derivative-images.json" ]
 [ -f "$work/out-parent/good/app-vm-wayland-standard.mcnf-manifest.json" ]
+[ -f "$work/out-parent/good/browser-vm-chromium.qcow2.mcnf-manifest.json" ]
+[ ! -e "$work/out-parent/good/browser-vm-chromium.mcnf-manifest.json" ]
 [ -f "$work/out-parent/good/browser-vm-chromium.profile.env" ]
 grep -Fxq "BROWSER_VM_SOURCE_COMMIT=$REVISION" \
   "$work/out-parent/good/browser-vm-chromium.profile.env"
@@ -114,6 +116,7 @@ grep -Fq "browser-builder --profile " "$work/calls"
 grep -Fq -- "--source-revision $REVISION" "$work/calls"
 grep -Fq "manifest-verify verify --repo-root $ROOT --profile " "$work/calls"
 grep -Fq -- "/collection/browser-vm-chromium.profile.env" "$work/calls"
+grep -Fq -- "/collection/browser-vm-chromium.qcow2.mcnf-manifest.json" "$work/calls"
 grep -Fq -- "--source-revision $REVISION" "$work/calls"
 [ "$before" = "$(sha256sum "$work/workstation.rpm" "$work/lighthouse.rpm")" ]
 

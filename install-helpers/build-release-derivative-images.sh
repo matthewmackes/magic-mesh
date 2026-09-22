@@ -143,13 +143,13 @@ for pair in 'App VM disk' "$app_disk" 'Browser VM disk' "$browser_disk" 'Browser
 done
 install -m 0400 -- "$app_disk" "$collection/app-vm-wayland-standard.qcow2"
 install -m 0400 -- "$browser_disk" "$collection/browser-vm-chromium.qcow2"
-install -m 0400 -- "$browser_manifest" "$collection/browser-vm-chromium.mcnf-manifest.json"
+install -m 0400 -- "$browser_manifest" "$collection/browser-vm-chromium.qcow2.mcnf-manifest.json"
 install -m 0400 -- "$frozen_profile" "$collection/browser-vm-chromium.profile.env"
 python3 "$BROWSER_MANIFEST_VERIFY" verify --repo-root "$ROOT" \
     --profile "$collection/browser-vm-chromium.profile.env" \
     --source-revision "$source_revision" \
     --image "$collection/browser-vm-chromium.qcow2" \
-    --manifest "$collection/browser-vm-chromium.mcnf-manifest.json" >/dev/null \
+    --manifest "$collection/browser-vm-chromium.qcow2.mcnf-manifest.json" >/dev/null \
     || refuse 'published Browser VM profile/manifest re-verification failed'
 python3 - "$collection" "$source_revision" <<'PY'
 import hashlib, json, os, pathlib, sys
@@ -174,7 +174,7 @@ with os.fdopen(fd, "wb") as stream:
     stream.write((json.dumps(app_manifest, sort_keys=True, separators=(",", ":")) + "\n").encode())
     stream.flush(); os.fsync(stream.fileno())
 artifacts = {}
-for name in ("app-vm-wayland-standard.qcow2", "app-vm-wayland-standard.mcnf-manifest.json", "browser-vm-chromium.qcow2", "browser-vm-chromium.mcnf-manifest.json", "browser-vm-chromium.profile.env"):
+for name in ("app-vm-wayland-standard.qcow2", "app-vm-wayland-standard.mcnf-manifest.json", "browser-vm-chromium.qcow2", "browser-vm-chromium.qcow2.mcnf-manifest.json", "browser-vm-chromium.profile.env"):
     path = root / name
     artifacts[name] = {"sha256": digest(path), "size": path.stat().st_size}
 document = {"artifacts": artifacts, "kind": "mcnf-first-release-derivative-image-collection", "promotion": "forbidden", "schema_version": 1, "source_revision": revision}
