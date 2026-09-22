@@ -7,7 +7,7 @@ tasks.
 
 ## Current Snapshot - 2026-09-22 critical-path finish of production 13.0.0
 
-- **9 active epics:** 3 `Remaining`, 5 `Blocked`, 1 `Awaiting testing`, 0 `Needs clarification`.
+- **9 active epics:** 4 `Remaining`, 4 `Blocked`, 1 `Awaiting testing`, 0 `Needs clarification`.
   Feature source is archived (`WL-FUNC-023` on 2026-08-30; `WL-FUNC-024` through
   `WL-FUNC-032` on 2026-08-29). This file is now the release-finish tracker, not a
   feature drain. Operator 2026-08-29 one-at-a-time source close still applies:
@@ -17,8 +17,10 @@ tasks.
   dest, mesh-id, or bearer. Do not flip `production_admitted`.
 - **Latest stable integration:** 43 exact hostile gates passed across four farm hosts: `evidence/WORKLIST-2026-08-11-stable-exact-wave-r473.md`.
 - **Critical path (execute this, then flip the next Blocked epic to Remaining):**
-  1. `WL-REL-003` S4/S6 — build Browser VM and App VM derivatives once, then write
-     the six-role plan input. This is the only Remaining source leftover.
+  1. `WL-REL-003` S4/S6 complete. Collection
+     `/home/mm/mcnf-private-s4/derivatives-42035dcbd` and six-role plan
+     `release-output-plan-42035dcbd-collect.json` exist. Evidence:
+     `WL-REL-003-2026-09-22-s4-s6-42035dcbd-r6.md`.
   2. `WL-REL-004` — collect, gate, SBOM, and sign the six-role envelope.
   3. `WL-REL-005` — tag, publish, clean-room readback, then a testing Beta.
   4. `WL-TEST-003` — live-seat and operator testing after that Beta.
@@ -34,9 +36,8 @@ tasks.
     (`WL-REL-001-2026-09-22-rpm-secret-inspect-r1.md`).
   - `WL-REL-006` — dest-operator leftovers closed; `production_admitted` is
     fail-closed; in-tree Surface stack stays blocked.
-  - `WL-REL-002` — unsigned freeze handoff exists; native F44 `.131` is halted
-    and must not RAM-steal `.130` while `WL-REL-003` S4 runs.
-  - `WL-REL-004` / `WL-REL-005` — predecessor not green.
+  - `WL-REL-002` — unsigned freeze handoff exists; native F44 `.131` is halted.
+  - `WL-REL-005` — predecessor not green.
   - `WL-TEST-003` — Awaiting a testing Beta. Dest-cut `bc14a22d7` and freeze-SHA
     seat installs are not that Beta.
 - **Single-authority lock:** typed Workload operations are the only VM/container
@@ -92,12 +93,13 @@ tasks.
 
 ## Active Drain Goal
 
-Finish production `13.0.0` by executing the one unblocked source leftover
-(`WL-REL-003` S4/S6), keeping farm fixture gates green on `WL-TEST-002`, and
-leaving parked lanes parked. Reuse a fresh HEAD farm result. Do not grind
-`cargo test --workspace` or `cargo build --workspace`. Do not fan
-dest-operator, live-seat, or release-wait leftovers. After `WL-REL-003` S6
-passes, flip `WL-REL-004` to Remaining and continue the chain.
+Finish production `13.0.0` by collecting and signing the six-role envelope
+(`WL-REL-004`), now that `WL-REL-003` S4/S6 has a verified derivative
+collection and a freeze-checkout plan. Keep farm fixture gates green on
+`WL-TEST-002`. Leave parked lanes parked. Do not grind `cargo test
+--workspace` or `cargo build --workspace`. Do not fan dest-operator,
+live-seat, or release-wait leftovers. After `WL-REL-004` S5 passes, flip
+`WL-REL-005` to Remaining.
 
 ## Solved Alerts and Blockers — 2026-09-22
 
@@ -168,7 +170,8 @@ Reference for future AI agents encountering similar issues.
 
 ## Service Release Queue
 
-1. Build Browser VM and App VM derivatives and the six-role plan (`WL-REL-003`).
+1. Collect, gate, SBOM, and sign the six-role envelope (`WL-REL-004`). S1
+   collection PASS.
 2. Assemble and sign the six-role evidence bundle (`WL-REL-004`).
 3. Publish `magic-mesh-v13.0.0`, read back, and cut a testing Beta (`WL-REL-005`).
 4. Execute live-seat and operator testing (`WL-TEST-003`).
@@ -208,8 +211,8 @@ busy on those Remaining units only. After every commit/push, start
 `automation/reconciler/tick-fill.sh`. Do not wait for the 15-min timer. Do not
 hand-fan a cargo command the reconciler already owns. When cargo is fresh at
 the current clean HEAD, the next act is
-`automation/drain/leftover-units.sh runnable` — today that is
-`@leftover:{source}` on `WL-REL-003`. Live-seat leftovers live on
+`automation/drain/leftover-units.sh runnable`. `WL-REL-003` S4/S6 is
+done. Live-seat leftovers live on `WL-TEST-003` and are not runnable.
 `WL-TEST-003` and are not runnable. `@leftover:{dest-operator}` /
 `keep` / `release-wait` do not fill slots and do not authorize invented dests.
 
@@ -273,8 +276,8 @@ Local heavy `cargo` remains blocked by
 - Relevant files/components: `docs/platform/WORKLIST.md`, release/farm helpers,
   OpenTofu farm declarations, release input producers, packaging, evidence
   collectors, and publication verifiers.
-- Dependencies: next unblocked owner is `WL-REL-003`. Parked owners are
-  `WL-REL-001`, `WL-REL-002`, `WL-REL-006`, `WL-REL-004`, `WL-REL-005`, and
+- Dependencies: next unblocked owner is `WL-REL-004`. Parked owners are
+  `WL-REL-001`, `WL-REL-002`, `WL-REL-006`, `WL-REL-005`, and
   `WL-TEST-003`.
 - Acceptance criteria: one clean source produces exactly six signed roles;
   real governed inputs pass preflight; production topology passes; signed
@@ -297,17 +300,13 @@ Local heavy `cargo` remains blocked by
   remaining source gap on freeze SHA `42035dcbd`.
 - Required outcome: self-sign the exact handoff RPMs without changing payload
   identity and produce Browser VM, App VM, and bootc roles.
-- Current state: freeze-SHA S1–S3 signed RPMs and candidate manifests exist on
-  BigBoy. S5 dest-cut bootc receipt inspect PASS. Browser VM base receipt
-  recovered from Fedora registry at dest-cut digest `3a5e74e6…`
-  (`WL-REL-003-2026-08-31-browser-base-receipt-42035dcbd-r1.md`); did not
-  follow moved quay `:44`. r2 REFUSED: dest-cut Fedora base lacked `cpio`.
-  r4 REFUSED: published sidecar omitted `.qcow2`. r5 on `.130` built both
-  images and REFUSED because the copied manifest still named `disk.qcow2`
-  (`WL-REL-003-2026-09-22-s4-derivatives-42035dcbd-r5.md`). The publisher now
-  rewrites `artifact.filename` to the published image name before re-verify.
-  Output `/home/mm/mcnf-private-s4/derivatives-42035dcbd` was not published.
-  Do not start `.131`.
+- Current state: S1–S3 signed RPMs match the S3 manifests on BigBoy. S5
+  bootc receipt inspect PASS. S4 r6 published
+  `/home/mm/mcnf-private-s4/derivatives-42035dcbd` (App VM `413ad462…`,
+  Browser VM `9fa55d39…`). S6 plan producer accepted six roles. The
+  collectable plan is `release-output-plan-42035dcbd-collect.json`, produced
+  from checkout `42035dcbd` so collector verifier paths match that HEAD.
+  Evidence: `WL-REL-003-2026-09-22-s4-s6-42035dcbd-r6.md`. Do not start `.131`.
 - Remaining work:
   1. S1 Complete: governed fingerprint `06B1C27EA0E08A225155EB3314018AA1497DDC7C`
      selected; keyring destroyed after sign.
@@ -326,9 +325,8 @@ Local heavy `cargo` remains blocked by
      - Validation: image manifest verifiers, qcow2 checks, source revision
        checks, and hostile substitution fixture.
      - Done when: both derivatives verify and the helper publishes no partial
-       output. r2 lacked `cpio`. r4 used a short sidecar name. r5 kept the
-       build filename `disk.qcow2`; the publisher now rewrites it to the
-       published image name before re-verification.
+       output. r6 PASS on `.130`. Evidence:
+       `WL-REL-003-2026-09-22-s4-s6-42035dcbd-r6.md`.
   5. S5 Complete: bootc dest-cut receipt inspect PASS. Evidence:
      `WL-REL-003-2026-08-31-s5-bootc-inspect-42035dcbd-r1.md`.
   6. S6 Create the exact six-role plan input.
@@ -340,7 +338,8 @@ Local heavy `cargo` remains blocked by
      - Validation: `produce-release-output-plan.py` accepts it; missing,
        duplicate, extra, relative, mutable, or cross-revision inputs refuse.
      - Done when: exactly six role records are accepted and no artifact path is
-       ambiguous.
+       ambiguous. PASS 2026-09-22. Collectable plan:
+       `/home/mm/mcnf-private-s4/release-output-plan-42035dcbd-collect.json`.
 - Scope: self-signing, candidate manifests, derivative generation, and plan
   input; no final evidence signing, publication, or installation.
 - Relevant files/components: install-helpers/sign-release.sh,
@@ -354,7 +353,6 @@ Local heavy `cargo` remains blocked by
 - Verification method: signing and role-specific verifiers, derivative hostile
   suite, plan producer, and independent hash/identity comparison.
   @farm:{cargo test -p mackesd}
-  @leftover:{source}
 - Origin or merged source IDs: archived WL-BUILD-001, WL-BUILD-003, WL-FUNC-016,
   WL-FUNC-017, and WL-CRIT-006 release roles.
 
@@ -524,20 +522,21 @@ Local heavy `cargo` remains blocked by
 
 ### WL-REL-004 - Assemble the signed six-role release evidence bundle
 
-- Status: Blocked
+- Status: Remaining
 - Priority: P0
 - Complexity: Epic
 - Problem: publication is forbidden until all artifacts, manifests, gates,
   SBOM data, checksums, and provenance form one exact signed bundle.
 - Required outcome: collect and verify all six roles, execute mandatory
   release gates, and sign one immutable publication envelope.
-- Current state: historical seven-role plan and collector pass for private
-  historical `afc24782` preview. That collection is promotion-forbidden and
-  is not freeze SHA `42035dcbd`. Waiting on `WL-REL-003` S4/S6. Evidence:
-  `docs/platform/evidence/WL-REL-003-WL-REL-004-preview-afc-r1.md`.
-- Remaining work: do not start until `WL-REL-003` S6 accepts exactly six
-  freeze-SHA roles. Then:
-  1. S1 Resume and collect the six-role output into an absent private path.
+- Current state: S1 collector PASS, six verified outputs, promotion
+  forbidden. Manifest:
+  `/home/mm/mcnf-private-s4/release-output-manifest-42035dcbd.json`.
+  Plan: `release-output-plan-42035dcbd-collect.json` from checkout
+  `42035dcbd`. Historical `afc24782` preview is not this bundle. Evidence:
+  `WL-REL-003-2026-09-22-s4-s6-42035dcbd-r6.md`.
+- Remaining work:
+  1. S1 Complete: six-role output collected on `.130`.
   2. S2 Execute the canonical gate matrix for `42035dcbd`.
   3. S3 Generate aggregate six-role SBOM/license and evidence envelope.
   4. S4 Sign checksums and provenance with `sign-release.sh --evidence`.
@@ -547,13 +546,13 @@ Local heavy `cargo` remains blocked by
 - Relevant files/components: install-helpers/run-first-full-release.sh,
   produce-release-output-plan.py, collect-release-outputs.py,
   release-gate-matrix.json, verify-release-gate-matrix.py, sign-release.sh.
-- Dependencies: blocked on `WL-REL-003` S6. Failed gate: six-role plan input
-  for `42035dcbd` does not exist. Live prepublication is `WL-TEST-003`.
+- Dependencies: `WL-REL-003` S6 is green. Live prepublication is
+  `WL-TEST-003`. Do not flip `production_admitted`.
 - Acceptance criteria: one signed immutable six-role evidence bundle passes
   all mandatory gates and rejects any artifact-set drift.
-- Verification method: after Status becomes Remaining, farm gates, collector
-  and gate verifiers, SBOM/evidence checks, and publication preflight.
-  Unblock payload: `@farm:{cargo test -p mde-bus}`.
+- Verification method: farm gates, collector and gate verifiers, SBOM/evidence
+  checks, and publication preflight.
+  @farm:{cargo test -p mde-bus}
 - Origin or merged source IDs: archived WL-BUILD-003 and WL-CRIT-006
   production-evidence responsibilities.
 
