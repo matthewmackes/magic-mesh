@@ -1,3 +1,7 @@
+> **HISTORICAL (2026-08-24):** installed-seat leftover probe. Names the
+> retired LizardFS-era `mesh-fs-status` CLI only to record that it is
+> not lock-11 FileOps. Live substrate is Syncthing `/mnt/mesh-storage`.
+
 # WL-FUNC-025 leftover honesty — Seat 15 mesh_mount worker + Files POSIX — r1
 
 Date: 2026-08-24  

@@ -4614,7 +4614,17 @@ impl Worker for WorkloadComputeWorker {
 
     async fn run(&mut self, mut shutdown: ShutdownToken) -> anyhow::Result<()> {
         self.register_migration_executor();
-        match crate::kvm::ensure_default_storage_pool() {
+        match crate::kvm::ensure_default_storage_pool(|args| {
+            let output = std::process::Command::new("virsh")
+                .args(args)
+                .output()
+                .map_err(|error| error.to_string())?;
+            Ok(crate::kvm::PoolCmd {
+                success: output.status.success(),
+                stdout: String::from_utf8_lossy(&output.stdout).into_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).into_owned(),
+            })
+        }) {
             Ok(crate::kvm::PoolPrepare::Defined) => {
                 tracing::info!(
                     target: "mackesd::workload_compute",
