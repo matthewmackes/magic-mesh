@@ -17,6 +17,7 @@
 resolver = "2"
 exclude = [
     "vendor/ironrdp-session",
+    "vendor/zbus_xml",
 ]
 members = [
     "crates/guest/mcnf-cuttlefish-guest",
@@ -98,6 +99,11 @@ spice-client = { path = "vendor/spice-client" }
 # which can index beyond the framebuffer. Keep the coherent 0.10 dependency
 # family and carry the narrowly backported upstream bounds fix.
 ironrdp-session = { path = "vendor/ironrdp-session" }
+# zbus_xml 4.0.0 is the last 4.x and is pinned by atspi-common 0.6.0 (egui 0.31
+# → accesskit_unix 0.13.1). It pulls yanked/advisory quick-xml 0.30.0; 5.x
+# dropped quick-xml but requires zvariant 5, which that atspi stack cannot
+# take. Carry 4.0.0 with quick-xml 0.41 until the egui/accesskit family moves.
+zbus_xml = { path = "vendor/zbus_xml" }
 
 [workspace.lints.rust]
 unsafe_code     = "forbid"
